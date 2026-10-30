@@ -1,0 +1,49 @@
+# Secrets and local configuration
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.p12
+*.pfx
+credentials/
+credentials.*
+secrets/
+secrets.*
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Unredistributed official artifact and downloaded archives
+tmp/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Generated experiment evidence and logs
+runs/
+results/
+outputs/
+logs/
+*.log
+*.jsonl
+
+# Build and editor output
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

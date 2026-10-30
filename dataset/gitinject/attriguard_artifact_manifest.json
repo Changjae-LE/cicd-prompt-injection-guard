@@ -1,0 +1,59 @@
+{
+  "schema_version": "causentry_attriguard_artifact_manifest_v1",
+  "artifact_id": "attriguard-usenix-security-2026-v1",
+  "source": {
+    "record_url": "https://zenodo.org/records/20308739",
+    "download_url": "https://zenodo.org/records/20308739/files/usenix-artifacts.zip?download=1",
+    "record_version": "v1",
+    "archive_name": "usenix-artifacts.zip",
+    "archive_size_bytes": 118255,
+    "archive_md5": "e8cf06c6c75abe4d3eb89412842b9cbf",
+    "archive_sha256": "81c6d58fdd09c8af217e59dc752dc032dab32c29e204dd7f9d936592174bbf1a"
+  },
+  "environment": {
+    "python": "3.10",
+    "agentdojo": "0.1.35",
+    "openai": ">=2.0.0,<3.0.0"
+  },
+  "files": [
+    {
+      "role": "core_algorithm",
+      "path": "usenix-artifacts/main/pipeline/AttriGuard.py",
+      "size_bytes": 43150,
+      "sha256": "6d28e2208efbd521bf3f2e90c553e57b11c786e65564eababacb8cdf4f8050d8"
+    },
+    {
+      "role": "official_openai_adapter",
+      "path": "usenix-artifacts/main/pipeline/openai_llm_compat.py",
+      "size_bytes": 13484,
+      "sha256": "706bfb0b26bf4cc5f317892798b509d82966bb0d92305f65be45cbcb4bd7764a"
+    },
+    {
+      "role": "official_pipeline_constructor",
+      "path": "usenix-artifacts/main/pipeline/my_agent_pipeline.py",
+      "size_bytes": 10838,
+      "sha256": "1976917813ea957529fcb5f8672ef1b2ac199b82b9fb5164c402d1998ae2f96d"
+    }
+  ],
+  "algorithm_contract": {
+    "class": "AttriGuardExecutionLoop",
+    "attenuation_level": 2,
+    "survival_mode": "fuzzy",
+    "core_must_remain_byte_identical": true,
+    "allowed_adaptations": [
+      "Provide CI/CD observations through an AgentDojo FunctionsRuntime tool already classified by the core as external.",
+      "Provide CI/CD side-effect tools through the same FunctionsRuntime without changing the AttriGuard implementation.",
+      "Collect traces, outcomes, latency, and usage outside the core module."
+    ],
+    "forbidden_adaptations": [
+      "Edit AttriGuard.py or its embedded prompts.",
+      "Subclass or monkey-patch AttriGuardExecutionLoop.",
+      "Change EXTERNAL_OUTPUT_TOOLS.",
+      "Replace teacher-forced replay, attenuation, fuzzy survival, or block behavior."
+    ]
+  },
+  "redistribution": {
+    "artifact_license_in_zenodo_record": "not_stated",
+    "policy": "Do not vendor the AttriGuard artifact into this MIT repository. Fetch it into an ignored local directory and verify every used file before import."
+  }
+}
