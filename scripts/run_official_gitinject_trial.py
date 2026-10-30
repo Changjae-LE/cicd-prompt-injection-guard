@@ -9,10 +9,16 @@ official cleanup sequence to continue.
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
+from itertools import islice
 import json
 import os
 from pathlib import Path
+import re
 import sys
+import time
+import traceback
+from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,12 +40,154 @@ from attriguard_gitinject.github_actions_integration import (  # noqa: E402
 REPOSITORY_ID_VARIABLE = "ATTRIGUARD_BENCHMARK_REPOSITORY_ID"
 REPOSITORY_ID_SENTINEL = "__BIND_GITINJECT_CREATED_REPOSITORY_ID__"
 WORKFLOWS = {"attriguard-gitinject-baseline", "attriguard-gitinject-defended"}
+_SECRET_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*"),
+)
+_SENSITIVE_ENVIRONMENT_NAMES = (
+    "GITHUB_TOKEN",
+    "ATTACKER_GITHUB_TOKEN",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+)
 
 
 def _write_json_exclusive(path: Path, value: dict) -> None:
     with path.open("x", encoding="utf-8", newline="\n") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
         stream.write("\n")
+
+
+def _sanitize_traceback(value: str) -> str:
+    sanitized = value
+    for name in _SENSITIVE_ENVIRONMENT_NAMES:
+        secret = os.environ.get(name)
+        if secret and len(secret) >= 8:
+            sanitized = sanitized.replace(secret, f"[REDACTED_ENV:{name}]")
+    for pattern in _SECRET_PATTERNS:
+        sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
+    return sanitized
+
+
+def _call_with_swallowed_exception_trace(
+    call: Callable[[], dict[str, Any]],
+    *,
+    target_code: Any,
+) -> tuple[dict[str, Any], dict[str, str] | None]:
+    """Capture an exception that the official runner converts to ``result.error``."""
+
+    candidates: list[dict[str, str]] = []
+    previous_trace = sys.gettrace()
+
+    def tracer(frame, event, argument):
+        if event == "exception" and frame.f_code is target_code:
+            exception_type, exception, exception_traceback = argument
+            candidates.append(
+                {
+                    "error_type": exception_type.__name__,
+                    "error": str(exception),
+                    "traceback": "".join(
+                        traceback.format_exception(
+                            exception_type, exception, exception_traceback
+                        )
+                    ),
+                }
+            )
+        return tracer
+
+    sys.settrace(tracer)
+    try:
+        result = call()
+    finally:
+        sys.settrace(previous_trace)
+    error = result.get("error")
+    if not isinstance(error, str):
+        return result, None
+    match = next(
+        (candidate for candidate in reversed(candidates) if candidate["error"] == error),
+        None,
+    )
+    return result, match
+
+
+def _record_failure_diagnostic(
+    result: dict[str, Any], failure: dict[str, str]
+) -> None:
+    runs_dir = result.get("runs_dir")
+    if not isinstance(runs_dir, str):
+        return
+    directory = Path(runs_dir).resolve(strict=True)
+    sanitized = _sanitize_traceback(failure["traceback"])
+    traceback_path = directory / "failure_traceback.txt"
+    with traceback_path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(sanitized)
+        if not sanitized.endswith("\n"):
+            stream.write("\n")
+    diagnostic = {
+        "schema_version": "causentry_gitinject_failure_diagnostic_v1",
+        "error_type": failure["error_type"],
+        "error": _sanitize_traceback(failure["error"]),
+        "traceback_file": traceback_path.name,
+        "traceback_sha256": sha256(sanitized.encode("utf-8")).hexdigest(),
+        "source": "custom_runner_observer_without_official_gitinject_modification",
+    }
+    diagnostic_path = directory / "failure_diagnostic.json"
+    _write_json_exclusive(diagnostic_path, diagnostic)
+    result["failure_diagnostic"] = str(diagnostic_path)
+
+
+def _prepare_trial_with_safe_workflow_runs(
+    runner: Any,
+    scenario: Any,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """GitInject 0.1.0 ``_prepare_trial`` with only empty-run slicing fixed."""
+
+    from gitinject.evidence import DEFAULT_AGENT_LOGINS
+
+    metadata = (
+        metadata
+        if metadata is not None
+        else getattr(runner, "_workflow_metadata", {})
+    )
+    state = scenario.runtime_state
+    state.pop("observed_details", None)
+    state["agent_logins"] = list(
+        (metadata or {}).get("agent_logins", sorted(DEFAULT_AGENT_LOGINS))
+    )
+    state["input_logins"] = sorted(
+        {
+            client.get_authenticated_user_login()
+            for client in (runner.gh_client, runner.event_gh_client)
+        }
+    )
+    workflow_runs = runner.gh_client.repository.get_workflow_runs()
+    runner._baseline_run_ids = {run.id for run in islice(workflow_runs, 100)}
+    event = scenario.get_event()
+    number = event.get("data", {}).get("number")
+    if number and event["event_type"] == "issue_comment":
+        state["issue_number"] = number
+    elif number and event["event_type"] in {
+        "pull_request_review",
+        "pull_request_review_comment",
+    }:
+        state["pr_number"] = number
+    baseline = (
+        runner._capture_gh_state(scenario)
+        if state.get("pr_number") or state.get("issue_number")
+        else {}
+    )
+    if baseline.get("error"):
+        raise RuntimeError(
+            f"Cannot establish evidence boundary: {baseline['error']}"
+        )
+    state["baseline_artifact_ids"] = [
+        f"{item['kind']}:{item['id']}"
+        for item in baseline.get("comment_details", [])
+    ]
+    state["triggered_at"] = int(time.time())
+    runner._trial_state = state
 
 
 def _build_live_types(expected_owner: str, expected_prefix: str):
@@ -63,6 +211,25 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
             return super().set_variable(name, str(self.bound_repository_id))
 
     class EvidenceCollectingBenchmarkRunner(BenchmarkRunner):
+        def _prepare_trial(self, scenario, metadata=None):
+            return _prepare_trial_with_safe_workflow_runs(self, scenario, metadata)
+
+        def run(self, *args, **kwargs):
+            result, failure = _call_with_swallowed_exception_trace(
+                lambda: super(EvidenceCollectingBenchmarkRunner, self).run(
+                    *args, **kwargs
+                ),
+                target_code=BenchmarkRunner.run.__code__,
+            )
+            if failure is not None:
+                try:
+                    _record_failure_diagnostic(result, failure)
+                except (AttriGuardIntegrationError, OSError, ValueError) as error:
+                    result["failure_diagnostic_error"] = (
+                        f"{type(error).__name__}: {error}"
+                    )
+            return result
+
         def _cleanup(self, scenario, result, context):
             run_id = result.get("run_id")
             repository_id = getattr(self.gh_client, "bound_repository_id", None)
