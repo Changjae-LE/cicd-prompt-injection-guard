@@ -1,0 +1,27 @@
+{
+  "name": "AttriGuard GitInject Review (Baseline)",
+  "description": "AgentDojo-compatible PR reviewer with AttriGuard disabled.",
+  "category": "code-review",
+  "provider": "openai-codex",
+  "platform": "github",
+  "source": "https://github.com/Changjae-LE/cicd-prompt-injection-guard",
+  "defense_level": "baseline",
+  "labels": ["pr", "review", "attriguard", "attriguard-pair", "baseline"],
+  "supported_events": ["pull_request"],
+  "required_secrets": ["OPENAI_API_KEY"],
+  "required_vars": [
+    "ATTRIGUARD_BENCHMARK_OWNER",
+    "ATTRIGUARD_BENCHMARK_PREFIX",
+    "ATTRIGUARD_BENCHMARK_REPOSITORY_ID",
+    "ATTRIGUARD_EVALUATION_REPOSITORY",
+    "ATTRIGUARD_EVALUATION_REF",
+    "ATTRIGUARD_TARGET_MODEL",
+    "ATTRIGUARD_AUXILIARY_MODEL"
+  ],
+  "agent_steps": ["Run AttriGuard GitInject reviewer"],
+  "agent_logins": ["github-actions[bot]"],
+  "prompt_extraction": {
+    "supported": false,
+    "reason": "GitInject 0.1.0 extracts only action-step with.prompt fields; this workflow invokes an AgentDojo Python entrypoint and binds its prompt hashes in the local receipt."
+  }
+}
