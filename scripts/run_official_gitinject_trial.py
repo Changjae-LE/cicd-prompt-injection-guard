@@ -238,6 +238,29 @@ def _normalize_batch_paths(
     return normalized_additions, normalized_deletions
 
 
+def _call_with_scenario_github_client_type(
+    client_type: type,
+    call: Callable[[], Any],
+) -> Any:
+    """Scope the compatibility client to scenario-created clients in one trial.
+
+    GitInject 0.1.0's ``setup_attacker_fork`` constructs a fresh client from
+    ``gitinject.utils.scenario_resources.GitHubClient`` instead of reusing the
+    owner client supplied to the runner.  Rebinding that module-level factory
+    for the duration of one runner call makes both actors cross the same safe
+    POSIX-path boundary without modifying the installed GitInject package.
+    """
+
+    from gitinject.utils import scenario_resources
+
+    original_type = scenario_resources.GitHubClient
+    scenario_resources.GitHubClient = client_type
+    try:
+        return call()
+    finally:
+        scenario_resources.GitHubClient = original_type
+
+
 def _workflow_run_snapshot(run: Any, exclusion: str | None) -> dict[str, Any]:
     created_at = getattr(run, "created_at", None)
     pull_requests = getattr(run, "pull_requests", None) or []
@@ -860,10 +883,7 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
     from gitinject.utils.gh_client import GitHubClient
     from tenacity import retry, retry_if_result, stop_after_attempt, wait_exponential
 
-    class IdentityBindingGitHubClient(GitHubClient):
-        bound_repository_id: int | None = None
-        workflow_deployment_observer: Callable[[], None] | None = None
-
+    class PosixPathGitHubClient(GitHubClient):
         def batch_sync(self, additions, deletions, message, branch=None):
             try:
                 normalized_additions, normalized_deletions = _normalize_batch_paths(
@@ -871,9 +891,21 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
                 )
             except ValueError as error:
                 return False, str(error)
-            result = super().batch_sync(
+            return super().batch_sync(
                 normalized_additions,
                 normalized_deletions,
+                message,
+                branch,
+            )
+
+    class IdentityBindingGitHubClient(PosixPathGitHubClient):
+        bound_repository_id: int | None = None
+        workflow_deployment_observer: Callable[[], None] | None = None
+
+        def batch_sync(self, additions, deletions, message, branch=None):
+            result = super().batch_sync(
+                additions,
+                deletions,
                 message,
                 branch,
             )
@@ -902,6 +934,8 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
             return super().set_variable(name, str(self.bound_repository_id))
 
     class EvidenceCollectingBenchmarkRunner(BenchmarkRunner):
+        scenario_github_client_type = PosixPathGitHubClient
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.gh_client.workflow_deployment_observer = (
@@ -969,11 +1003,14 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
             )
 
         def run(self, *args, **kwargs):
-            result, failure = _call_with_swallowed_exception_trace(
-                lambda: super(EvidenceCollectingBenchmarkRunner, self).run(
-                    *args, **kwargs
+            result, failure = _call_with_scenario_github_client_type(
+                self.scenario_github_client_type,
+                lambda: _call_with_swallowed_exception_trace(
+                    lambda: super(EvidenceCollectingBenchmarkRunner, self).run(
+                        *args, **kwargs
+                    ),
+                    target_code=BenchmarkRunner.run.__code__,
                 ),
-                target_code=BenchmarkRunner.run.__code__,
             )
             if failure is not None:
                 try:

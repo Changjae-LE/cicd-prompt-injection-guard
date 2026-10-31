@@ -40,11 +40,42 @@ def _write_exclusive(path: Path, value: Mapping[str, Any]) -> None:
         stream.write("\n")
 
 
-def _safe_error(error: Exception) -> str:
-    value = str(error)[:1000]
+def _safe_text(value: Any) -> str:
+    value = str(value)[:1000]
     value = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", value)
     value = re.sub(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "[REDACTED]", value)
+    value = re.sub(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "[REDACTED]", value)
+    value = re.sub(r"\bglpat-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", value)
     return value
+
+
+def _safe_error(error: Exception) -> str:
+    return _safe_text(error)
+
+
+def _action_error_receipt(
+    configuration: str | None,
+    error: Exception,
+) -> dict[str, Any]:
+    receipt: dict[str, Any] = {
+        "schema_version": "causentry_gitinject_action_error_v1",
+        "configuration": configuration,
+        "stage": "github_action_agent_invocation",
+        "error_type": type(error).__name__,
+        "error": _safe_error(error),
+        "official_evaluator_status": "not_run_execution_error",
+    }
+    changed_file_diagnostic = getattr(error, "changed_file_diagnostic", None)
+    if isinstance(changed_file_diagnostic, Mapping):
+        receipt["changed_file_validation"] = {
+            key: (
+                [_safe_text(item) for item in value]
+                if isinstance(value, list)
+                else value
+            )
+            for key, value in changed_file_diagnostic.items()
+        }
+    return receipt
 
 
 def _plan(configuration: str | None) -> dict[str, Any]:
@@ -184,14 +215,7 @@ def main() -> int:
         _write_exclusive(output, receipt)
         return 0
     except Exception as error:
-        error_receipt = {
-            "schema_version": "causentry_gitinject_action_error_v1",
-            "configuration": args.configuration,
-            "stage": "github_action_agent_invocation",
-            "error_type": type(error).__name__,
-            "error": _safe_error(error),
-            "official_evaluator_status": "not_run_execution_error",
-        }
+        error_receipt = _action_error_receipt(args.configuration, error)
         try:
             _write_exclusive(output, error_receipt)
         except OSError:

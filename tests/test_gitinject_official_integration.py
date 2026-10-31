@@ -5,8 +5,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,12 +25,15 @@ from attriguard_gitinject.artifact_collection import (  # noqa: E402
     collect_gitinject_artifact,
 )
 from attriguard_gitinject.github_actions_integration import (  # noqa: E402
+    ChangedFileSetMismatchError,
     GitHubReviewCommentSink,
     bind_official_and_local_results,
     build_live_gitinject_workspace,
+    git_changed_paths,
     load_official_gitinject_manifest,
     validate_benchmark_repository,
 )
+from run_gitinject_github_action import _action_error_receipt  # noqa: E402
 from verify_gitinject_integration import (  # noqa: E402
     TEMP_ENVIRONMENT,
     _load_yaml,
@@ -423,7 +428,9 @@ class GitHubEvidenceIntegrationTests(unittest.TestCase):
     def test_changed_file_set_must_match_official_scenario_exactly(self):
         extra = self.root / "extra.txt"
         extra.write_text("extra", encoding="utf-8")
-        with self.assertRaisesRegex(AttriGuardIntegrationError, "Changed-file set"):
+        with self.assertRaisesRegex(
+            ChangedFileSetMismatchError, "Changed-file set"
+        ) as caught:
             build_live_gitinject_workspace(
                 event=official_event(),
                 repository_root=self.root,
@@ -435,6 +442,73 @@ class GitHubEvidenceIntegrationTests(unittest.TestCase):
                     "extra.txt",
                 ),
             )
+        diagnostic = caught.exception.changed_file_diagnostic
+        self.assertEqual(
+            diagnostic["expected_paths"],
+            ["CLAUDE.md", "src/flask/csrf.py", "tests/test_csrf.py"],
+        )
+        self.assertEqual(diagnostic["missing_paths"], [])
+        self.assertEqual(diagnostic["extra_paths"], ["extra.txt"])
+        self.assertFalse(diagnostic["contains_file_contents"])
+
+    def test_windows_backslash_paths_are_not_treated_as_official_posix_paths(self):
+        with self.assertRaises(ChangedFileSetMismatchError) as caught:
+            build_live_gitinject_workspace(
+                event=official_event(),
+                repository_root=self.root,
+                action_sink=self.sink,
+                changed_paths=(
+                    "CLAUDE.md",
+                    r"src\flask\csrf.py",
+                    r"tests\test_csrf.py",
+                ),
+            )
+        diagnostic = caught.exception.changed_file_diagnostic
+        self.assertEqual(
+            diagnostic["missing_paths"],
+            ["src/flask/csrf.py", "tests/test_csrf.py"],
+        )
+        self.assertEqual(
+            diagnostic["extra_paths"],
+            [r"src\flask\csrf.py", r"tests\test_csrf.py"],
+        )
+
+    def test_action_error_receipt_records_paths_only_with_secret_redaction(self):
+        error = ChangedFileSetMismatchError(
+            expected=("CLAUDE.md", "src/flask/csrf.py"),
+            observed=("CLAUDE.md", "ghp_abcdefghijklmnopqrstuvwxyz.txt"),
+        )
+        receipt = _action_error_receipt("baseline", error)
+        diagnostic = receipt["changed_file_validation"]
+        self.assertEqual(
+            receipt["official_evaluator_status"], "not_run_execution_error"
+        )
+        self.assertEqual(diagnostic["missing_paths"], ["src/flask/csrf.py"])
+        self.assertEqual(diagnostic["extra_paths"], ["[REDACTED].txt"])
+        self.assertFalse(diagnostic["contains_file_contents"])
+
+    def test_git_changed_paths_uses_nul_delimited_exact_names(self):
+        completed = SimpleNamespace(
+            stdout=(
+                b"CLAUDE.md\0"
+                b"src\\flask\\csrf.py\0"
+                b"tests/test_csrf.py\0"
+            )
+        )
+        with patch(
+            "attriguard_gitinject.github_actions_integration.subprocess.run",
+            return_value=completed,
+        ) as run:
+            paths = git_changed_paths(
+                self.root,
+                base_sha="1" * 40,
+                head_sha="2" * 40,
+            )
+        self.assertIn("-z", run.call_args.args[0])
+        self.assertEqual(
+            paths,
+            ["CLAUDE.md", r"src\flask\csrf.py", "tests/test_csrf.py"],
+        )
 
     def test_source_and_test_hashes_are_enforced(self):
         (self.root / "src/flask/csrf.py").write_text("changed", encoding="utf-8")

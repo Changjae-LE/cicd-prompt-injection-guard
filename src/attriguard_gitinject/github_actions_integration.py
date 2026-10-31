@@ -37,6 +37,26 @@ DEFAULT_GITINJECT_MANIFEST = (
 _NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
+class ChangedFileSetMismatchError(AttriGuardIntegrationError):
+    """Exact official changed-file contract mismatch, with paths-only evidence."""
+
+    def __init__(self, *, expected: Sequence[str], observed: Sequence[str]):
+        expected_set = set(expected)
+        observed_set = set(observed)
+        self.changed_file_diagnostic = {
+            "schema_version": "causentry_gitinject_changed_file_validation_v1",
+            "matches_official_scenario": False,
+            "expected_paths": sorted(expected_set),
+            "observed_paths": sorted(observed_set),
+            "missing_paths": sorted(expected_set - observed_set),
+            "extra_paths": sorted(observed_set - expected_set),
+            "contains_file_contents": False,
+        }
+        super().__init__(
+            "Changed-file set does not match official supply_chain_malicious_code"
+        )
+
+
 def load_official_gitinject_manifest(
     path: str | Path = DEFAULT_GITINJECT_MANIFEST,
 ) -> dict[str, Any]:
@@ -302,6 +322,7 @@ def git_changed_paths(
         str(root),
         "diff",
         "--name-only",
+        "-z",
         "--diff-filter=ACMRT",
         base_sha,
         head_sha,
@@ -312,14 +333,23 @@ def git_changed_paths(
             command,
             check=True,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
         )
     except (OSError, subprocess.CalledProcessError, UnicodeError) as error:
         raise AttriGuardIntegrationError(
             "Unable to derive changed paths from the checked-out pull request"
         ) from error
-    paths = sorted({line.strip().replace("\\", "/") for line in completed.stdout.splitlines() if line.strip()})
+    try:
+        paths = sorted(
+            {
+                raw_path.decode("utf-8")
+                for raw_path in completed.stdout.split(b"\0")
+                if raw_path
+            }
+        )
+    except UnicodeError as error:
+        raise AttriGuardIntegrationError(
+            "Unable to decode changed paths from the checked-out pull request"
+        ) from error
     if not paths:
         raise AttriGuardIntegrationError("Pull-request diff contains no readable changed files")
     return paths
@@ -374,14 +404,19 @@ def build_live_gitinject_workspace(
             base_sha=_event_sha(pull_request_event, "base"),
             head_sha=_event_sha(pull_request_event, "head"),
         )
-    normalized = sorted(
-        {GitInjectCICDWorkspace._normalize_repo_path(path) for path in changed_paths}
-    )
     expected_changed_files = manifest["scenario"]["changed_files"]
-    if set(normalized) != set(expected_changed_files):
-        raise AttriGuardIntegrationError(
-            "Changed-file set does not match official supply_chain_malicious_code"
+    observed_changed_paths = sorted(set(changed_paths))
+    if set(observed_changed_paths) != set(expected_changed_files):
+        raise ChangedFileSetMismatchError(
+            expected=tuple(expected_changed_files),
+            observed=observed_changed_paths,
         )
+    normalized = sorted(
+        {
+            GitInjectCICDWorkspace._normalize_repo_path(path)
+            for path in observed_changed_paths
+        }
+    )
 
     visible_files: dict[str, str] = {}
     for relative in normalized:
