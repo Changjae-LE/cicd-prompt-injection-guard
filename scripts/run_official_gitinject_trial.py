@@ -42,6 +42,8 @@ REPOSITORY_ID_VARIABLE = "ATTRIGUARD_BENCHMARK_REPOSITORY_ID"
 REPOSITORY_ID_SENTINEL = "__BIND_GITINJECT_CREATED_REPOSITORY_ID__"
 WORKFLOWS = {"attriguard-gitinject-baseline", "attriguard-gitinject-defended"}
 WORKFLOW_WAIT_TIMEOUT = "Timed out waiting for workflow run or could not find it."
+WORKFLOW_DEPLOYMENT_ERROR = "Workflow deployment verification failed"
+WORKFLOW_DIAGNOSTIC_SCHEMA = "causentry_gitinject_workflow_diagnostic_v2"
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
@@ -207,6 +209,35 @@ def _diagnostic_error(error: Exception) -> dict[str, Any]:
     return result
 
 
+def _normalize_repository_path(path: str) -> str:
+    """Convert a host path into a safe POSIX Git tree path."""
+
+    normalized = str(path).replace("\\", "/").strip("/")
+    parts = normalized.split("/") if normalized else []
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Unsafe repository path: {path!r}")
+    return "/".join(parts)
+
+
+def _normalize_batch_paths(
+    additions: dict[str, Any],
+    deletions: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    normalized_additions: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    for path, content in additions.items():
+        normalized = _normalize_repository_path(path)
+        if normalized in normalized_additions and sources[normalized] != path:
+            raise ValueError(
+                f"Repository path collision after normalization: "
+                f"{sources[normalized]!r} and {path!r}"
+            )
+        normalized_additions[normalized] = content
+        sources[normalized] = path
+    normalized_deletions = [_normalize_repository_path(path) for path in deletions]
+    return normalized_additions, normalized_deletions
+
+
 def _workflow_run_snapshot(run: Any, exclusion: str | None) -> dict[str, Any]:
     created_at = getattr(run, "created_at", None)
     pull_requests = getattr(run, "pull_requests", None) or []
@@ -320,12 +351,114 @@ def _record_wait_observation(runner: Any, observation: dict[str, Any]) -> None:
         errors.append(_diagnostic_error(error))
 
 
+def _read_actions_permissions(client: Any, repository_name: str) -> dict[str, Any]:
+    """Read Actions permissions without relying on GitHubClient's invalid gh.base_url."""
+
+    github = getattr(client, "gh", None)
+    requester = getattr(github, "_Github__requester", None)
+    if requester is not None and hasattr(requester, "requestJsonAndCheck"):
+        _, payload = requester.requestJsonAndCheck(
+            "GET", f"/repos/{repository_name}/actions/permissions"
+        )
+        return payload
+    response = client.request(
+        "GET", f"/repos/{repository_name}/actions/permissions"
+    )
+    return response.json()
+
+
+def _branch_workflow_tree_state(
+    repository: Any,
+    branch: str,
+    expected_paths: list[str],
+) -> dict[str, Any]:
+    """Inspect expected workflow paths by traversing non-recursive Git trees."""
+
+    branch_object = repository.get_branch(branch)
+    commit_sha = branch_object.commit.sha
+    commit = repository.get_git_commit(commit_sha)
+    root_tree_sha = commit.tree.sha
+    cache: dict[str, list[Any]] = {}
+
+    def entries(tree_sha: str) -> list[Any]:
+        if tree_sha not in cache:
+            cache[tree_sha] = list(
+                repository.get_git_tree(tree_sha, recursive=False).tree
+            )
+        return cache[tree_sha]
+
+    root_entries = entries(root_tree_sha)
+    path_states: dict[str, Any] = {}
+    for path in expected_paths:
+        current_tree_sha = root_tree_sha
+        traversed = []
+        state: dict[str, Any] = {"exists": True, "entries": traversed}
+        for index, component in enumerate(path.split("/")):
+            item = next(
+                (
+                    candidate
+                    for candidate in entries(current_tree_sha)
+                    if candidate.path == component
+                ),
+                None,
+            )
+            if item is None:
+                state.update(
+                    {
+                        "exists": False,
+                        "missing_component": component,
+                        "resolved_prefix": "/".join(path.split("/")[:index]),
+                    }
+                )
+                break
+            traversed.append(
+                {
+                    "path": "/".join(path.split("/")[: index + 1]),
+                    "type": getattr(item, "type", None),
+                    "mode": getattr(item, "mode", None),
+                    "sha": getattr(item, "sha", None),
+                }
+            )
+            if index < len(path.split("/")) - 1:
+                if getattr(item, "type", None) != "tree":
+                    state.update(
+                        {
+                            "exists": False,
+                            "missing_component": path.split("/")[index + 1],
+                            "non_tree_component": component,
+                        }
+                    )
+                    break
+                current_tree_sha = item.sha
+        path_states[path] = state
+
+    root_path_evidence = [
+        {
+            "path": getattr(item, "path", None),
+            "type": getattr(item, "type", None),
+            "sha": getattr(item, "sha", None),
+        }
+        for item in root_entries
+        if "\\" in str(getattr(item, "path", ""))
+        or str(getattr(item, "path", "")).startswith(".github")
+    ]
+    return {
+        "commit_sha": commit_sha,
+        "root_tree_sha": root_tree_sha,
+        "expected_paths": path_states,
+        "root_path_evidence": root_path_evidence,
+    }
+
+
 def _repository_workflow_state(runner: Any) -> dict[str, Any]:
     """Collect read-only repository, Actions, YAML, and workflow registration state."""
 
     captured: dict[str, Any] = {
         "captured_at": _utc_now(),
-        "repository": {"name": getattr(runner, "repo_name", None)},
+        "repository": {
+            "name": getattr(runner.gh_client, "repo_name", None)
+            or getattr(runner, "repo_name", None)
+        },
         "actions_permissions": {},
         "registered_workflows": [],
         "expected_workflows": {},
@@ -340,8 +473,14 @@ def _repository_workflow_state(runner: Any) -> dict[str, Any]:
         actual_id = getattr(repository, "id", None)
         bound_id = getattr(runner.gh_client, "bound_repository_id", None)
         default_branch = getattr(repository, "default_branch", None)
+        repository_name = (
+            getattr(repository, "full_name", None)
+            or getattr(runner.gh_client, "repo_name", None)
+            or getattr(runner, "repo_name", None)
+        )
         captured["repository"].update(
             {
+                "name": repository_name,
                 "id": actual_id,
                 "bound_id": bound_id,
                 "identity_matches": (
@@ -354,10 +493,9 @@ def _repository_workflow_state(runner: Any) -> dict[str, Any]:
         captured["repository"]["error"] = _diagnostic_error(error)
 
     try:
-        response = runner.gh_client.request(
-            "GET", f"/repos/{runner.repo_name}/actions/permissions"
+        permissions = _read_actions_permissions(
+            runner.gh_client, captured["repository"]["name"]
         )
-        permissions = response.json()
         captured["actions_permissions"] = {
             key: permissions.get(key)
             for key in ("enabled", "allowed_actions", "selected_actions_url")
@@ -383,6 +521,21 @@ def _repository_workflow_state(runner: Any) -> dict[str, Any]:
             captured["registered_workflows_error"] = _diagnostic_error(error)
 
     default_branch = captured["repository"].get("default_branch")
+    if repository is not None and default_branch:
+        try:
+            tree_state = _branch_workflow_tree_state(
+                repository,
+                default_branch,
+                sorted(expected),
+            )
+            captured["repository"]["default_branch_commit_sha"] = tree_state[
+                "commit_sha"
+            ]
+            captured["repository"]["root_tree_sha"] = tree_state["root_tree_sha"]
+            captured["git_tree_paths"] = tree_state["expected_paths"]
+            captured["root_path_evidence"] = tree_state["root_path_evidence"]
+        except Exception as error:
+            captured["git_tree_error"] = _diagnostic_error(error)
     for path, events in expected.items():
         yaml_state: dict[str, Any]
         if repository is None or not default_branch:
@@ -411,16 +564,127 @@ def _repository_workflow_state(runner: Any) -> dict[str, Any]:
 
 
 def _initialize_workflow_diagnostic(runner: Any) -> None:
-    runner._workflow_diagnostics = {
-        "schema_version": "causentry_gitinject_workflow_diagnostic_v1",
-        "created_at": _utc_now(),
-        "pre_trigger": _repository_workflow_state(runner),
-        "wait_attempts": [],
+    diagnostic = getattr(runner, "_workflow_diagnostics", None)
+    if not isinstance(diagnostic, dict):
+        diagnostic = {
+            "schema_version": WORKFLOW_DIAGNOSTIC_SCHEMA,
+            "created_at": _utc_now(),
+            "wait_attempts": [],
+        }
+        runner._workflow_diagnostics = diagnostic
+    diagnostic["schema_version"] = WORKFLOW_DIAGNOSTIC_SCHEMA
+    state = _repository_workflow_state(runner)
+    diagnostic["after_scenario_prepare"] = state
+    diagnostic["pre_trigger"] = state
+    diagnostic.setdefault("wait_attempts", [])
+
+
+def _missing_workflow_paths(state: dict[str, Any]) -> list[str]:
+    return sorted(
+        path
+        for path, expected in state.get("expected_workflows", {}).items()
+        if expected.get("default_branch_yaml", {}).get("exists") is False
+    )
+
+
+def _workflow_deployment_error(state: dict[str, Any]) -> str | None:
+    missing = _missing_workflow_paths(state)
+    if not missing:
+        return None
+    repository = state.get("repository", {})
+    return (
+        f"{WORKFLOW_DEPLOYMENT_ERROR}: missing on default branch "
+        f"{repository.get('default_branch')!r} at commit "
+        f"{repository.get('default_branch_commit_sha')!r}: {', '.join(missing)}"
+    )
+
+
+def _workflow_checkpoint_comparison(
+    diagnostic: dict[str, Any],
+) -> dict[str, Any] | None:
+    after_deployment = diagnostic.get("after_workflow_deployment")
+    after_prepare = diagnostic.get("after_scenario_prepare")
+    if not isinstance(after_deployment, dict) or not isinstance(after_prepare, dict):
+        return None
+    deployment_repository = after_deployment.get("repository", {})
+    prepare_repository = after_prepare.get("repository", {})
+    paths = sorted(
+        set(after_deployment.get("expected_workflows", {}))
+        | set(after_prepare.get("expected_workflows", {}))
+    )
+    workflows = {}
+    for path in paths:
+        deployment_yaml = (
+            after_deployment.get("expected_workflows", {})
+            .get(path, {})
+            .get("default_branch_yaml", {})
+        )
+        prepare_yaml = (
+            after_prepare.get("expected_workflows", {})
+            .get(path, {})
+            .get("default_branch_yaml", {})
+        )
+        deployment_tree = after_deployment.get("git_tree_paths", {}).get(path, {})
+        prepare_tree = after_prepare.get("git_tree_paths", {}).get(path, {})
+        deployment_state = {
+            "yaml_exists": deployment_yaml.get("exists"),
+            "yaml_sha": deployment_yaml.get("sha"),
+            "tree_exists": deployment_tree.get("exists"),
+            "tree_entries": deployment_tree.get("entries", []),
+        }
+        prepare_state = {
+            "yaml_exists": prepare_yaml.get("exists"),
+            "yaml_sha": prepare_yaml.get("sha"),
+            "tree_exists": prepare_tree.get("exists"),
+            "tree_entries": prepare_tree.get("entries", []),
+        }
+        deployment_leaf = (
+            deployment_state["tree_entries"][-1]
+            if deployment_state["tree_entries"]
+            else None
+        )
+        prepare_leaf = (
+            prepare_state["tree_entries"][-1]
+            if prepare_state["tree_entries"]
+            else None
+        )
+        deployment_identity = {
+            "yaml_exists": deployment_state["yaml_exists"],
+            "yaml_sha": deployment_state["yaml_sha"],
+            "tree_exists": deployment_state["tree_exists"],
+            "tree_leaf": deployment_leaf,
+        }
+        prepare_identity = {
+            "yaml_exists": prepare_state["yaml_exists"],
+            "yaml_sha": prepare_state["yaml_sha"],
+            "tree_exists": prepare_state["tree_exists"],
+            "tree_leaf": prepare_leaf,
+        }
+        workflows[path] = {
+            "after_workflow_deployment": deployment_state,
+            "after_scenario_prepare": prepare_state,
+            "changed": deployment_identity != prepare_identity,
+        }
+    deployment_commit = deployment_repository.get("default_branch_commit_sha")
+    prepare_commit = prepare_repository.get("default_branch_commit_sha")
+    return {
+        "default_branch": {
+            "after_workflow_deployment_commit_sha": deployment_commit,
+            "after_scenario_prepare_commit_sha": prepare_commit,
+            "commit_changed": deployment_commit != prepare_commit,
+        },
+        "workflows": workflows,
     }
 
 
 def _workflow_diagnostic_signals(diagnostic: dict[str, Any]) -> list[dict[str, Any]]:
-    state = diagnostic.get("timeout_repository_state") or diagnostic.get("pre_trigger") or {}
+    state = (
+        diagnostic.get("timeout_repository_state")
+        or diagnostic.get("after_scenario_prepare")
+        or diagnostic.get("pre_trigger")
+        or diagnostic.get("after_workflow_deployment")
+        or {}
+    )
     signals: list[dict[str, Any]] = []
     permissions = state.get("actions_permissions", {})
     if state.get("repository", {}).get("identity_matches") is False:
@@ -506,6 +770,7 @@ def _workflow_diagnostic_signals(diagnostic: dict[str, Any]) -> list[dict[str, A
     ) or any(
         (
             state.get("registered_workflows_error"),
+            state.get("git_tree_error"),
             workflow_query_error,
             timeout_query_error,
         )
@@ -528,6 +793,9 @@ def _persist_workflow_diagnostic(
     diagnostic["observer_errors"] = list(
         getattr(runner, "_workflow_diagnostic_observer_errors", [])
     )
+    comparison = _workflow_checkpoint_comparison(diagnostic)
+    if comparison is not None:
+        diagnostic["workflow_checkpoint_comparison"] = comparison
     if is_timeout:
         diagnostic["timeout_repository_state"] = _repository_workflow_state(runner)
         start_time = getattr(runner, "_trial_state", {}).get("triggered_at")
@@ -594,6 +862,31 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
 
     class IdentityBindingGitHubClient(GitHubClient):
         bound_repository_id: int | None = None
+        workflow_deployment_observer: Callable[[], None] | None = None
+
+        def batch_sync(self, additions, deletions, message, branch=None):
+            try:
+                normalized_additions, normalized_deletions = _normalize_batch_paths(
+                    additions, deletions
+                )
+            except ValueError as error:
+                return False, str(error)
+            result = super().batch_sync(
+                normalized_additions,
+                normalized_deletions,
+                message,
+                branch,
+            )
+            if (
+                result[0]
+                and message == "provision workflows"
+                and callable(self.workflow_deployment_observer)
+            ):
+                try:
+                    self.workflow_deployment_observer()
+                except Exception as error:
+                    return False, str(error)
+            return result
 
         def set_variable(self, name: str, value: str):
             if name != REPOSITORY_ID_VARIABLE:
@@ -609,24 +902,51 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
             return super().set_variable(name, str(self.bound_repository_id))
 
     class EvidenceCollectingBenchmarkRunner(BenchmarkRunner):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.gh_client.workflow_deployment_observer = (
+                self._capture_workflow_deployment_checkpoint
+            )
+
+        def _capture_workflow_deployment_checkpoint(self):
+            diagnostic = getattr(self, "_workflow_diagnostics", None)
+            if not isinstance(diagnostic, dict):
+                diagnostic = {
+                    "schema_version": WORKFLOW_DIAGNOSTIC_SCHEMA,
+                    "created_at": _utc_now(),
+                    "wait_attempts": [],
+                }
+                self._workflow_diagnostics = diagnostic
+            state = _repository_workflow_state(self)
+            diagnostic["after_workflow_deployment"] = state
+            error = _workflow_deployment_error(state)
+            if error:
+                raise RuntimeError(error)
+
         def _prepare_trial(self, scenario, metadata=None):
             result = _prepare_trial_with_safe_workflow_runs(self, scenario, metadata)
             try:
                 _initialize_workflow_diagnostic(self)
             except Exception as error:
                 self._workflow_diagnostics = {
-                    "schema_version": "causentry_gitinject_workflow_diagnostic_v1",
+                    "schema_version": WORKFLOW_DIAGNOSTIC_SCHEMA,
                     "created_at": _utc_now(),
                     "pre_trigger": {"error": _diagnostic_error(error)},
                     "wait_attempts": [],
                 }
+            else:
+                error = _workflow_deployment_error(
+                    self._workflow_diagnostics["after_scenario_prepare"]
+                )
+                if error:
+                    raise RuntimeError(error)
             return result
 
         def _record_workflow_wait_observation(self, observation):
             diagnostic = getattr(self, "_workflow_diagnostics", None)
             if not isinstance(diagnostic, dict):
                 diagnostic = {
-                    "schema_version": "causentry_gitinject_workflow_diagnostic_v1",
+                    "schema_version": WORKFLOW_DIAGNOSTIC_SCHEMA,
                     "created_at": _utc_now(),
                     "wait_attempts": [],
                 }
@@ -666,13 +986,16 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
 
         def _cleanup(self, scenario, result, context):
             is_timeout = result.get("error") == WORKFLOW_WAIT_TIMEOUT
+            requires_diagnostic = is_timeout or WORKFLOW_DEPLOYMENT_ERROR in str(
+                result.get("error", "")
+            )
             try:
                 _persist_workflow_diagnostic(self, result, scenario)
             except Exception as error:
                 result["workflow_diagnostic_error"] = (
                     f"{type(error).__name__}: {_sanitize_traceback(str(error))}"
                 )
-                if is_timeout:
+                if requires_diagnostic:
                     result["cleanup_deferred"] = True
                     return
             run_id = result.get("run_id")

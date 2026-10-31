@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -16,13 +17,18 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from gitinject.runner import BenchmarkRunner  # noqa: E402
+from gitinject.utils.gh_client import GitHubClient  # noqa: E402
 from run_official_gitinject_trial import (  # noqa: E402
+    WORKFLOW_DEPLOYMENT_ERROR,
     WORKFLOW_WAIT_TIMEOUT,
     _build_live_types,
     _evaluate_workflow_runs,
     _initialize_workflow_diagnostic,
+    _normalize_batch_paths,
+    _normalize_repository_path,
     _repository_workflow_state,
     _wait_for_run_with_safe_workflow_runs,
+    _workflow_checkpoint_comparison,
     _workflow_diagnostic_signals,
 )
 
@@ -48,12 +54,14 @@ class FakeRepository:
         workflows=(),
         contents=None,
         runs=(),
+        commit_sha="commit-1",
     ):
         self.id = repository_id
         self.default_branch = default_branch
         self._workflows = list(workflows)
         self._contents = dict(contents or {})
         self._runs = list(runs)
+        self.commit_sha = commit_sha
         self.read_calls = []
 
     def get_workflows(self):
@@ -74,6 +82,53 @@ class FakeRepository:
     def get_workflow_run(self, run_id):
         self.read_calls.append(("get_workflow_run", run_id))
         return next(run for run in self._runs if run.id == run_id)
+
+    def get_branch(self, branch):
+        self.read_calls.append(("get_branch", branch))
+        return SimpleNamespace(commit=SimpleNamespace(sha=self.commit_sha))
+
+    def get_git_commit(self, commit_sha):
+        self.read_calls.append(("get_git_commit", commit_sha))
+        return SimpleNamespace(tree=SimpleNamespace(sha=f"root-{commit_sha}"))
+
+    def get_git_tree(self, tree_sha, recursive=False):
+        self.read_calls.append(("get_git_tree", tree_sha, recursive))
+        commit_sha = tree_sha.split("-", 1)[1]
+        path = ".github/workflows/attriguard-review.yml"
+        has_workflow = (path, self.default_branch) in self._contents
+        if tree_sha.startswith("root-"):
+            entries = (
+                [
+                    SimpleNamespace(
+                        path=".github",
+                        type="tree",
+                        mode="040000",
+                        sha=f"github-{commit_sha}",
+                    )
+                ]
+                if has_workflow
+                else []
+            )
+        elif tree_sha.startswith("github-"):
+            entries = [
+                SimpleNamespace(
+                    path="workflows",
+                    type="tree",
+                    mode="040000",
+                    sha=f"workflows-{commit_sha}",
+                )
+            ]
+        else:
+            content = self._contents[(path, self.default_branch)]
+            entries = [
+                SimpleNamespace(
+                    path="attriguard-review.yml",
+                    type="blob",
+                    mode="100644",
+                    sha=content.sha,
+                )
+            ]
+        return SimpleNamespace(tree=entries)
 
 
 class FakeClient:
@@ -173,9 +228,51 @@ class RepositoryWorkflowStateTests(unittest.TestCase):
 
         diagnostic = runner._workflow_diagnostics
         self.assertIn("pre_trigger", diagnostic)
+        self.assertIn("after_scenario_prepare", diagnostic)
         expected = diagnostic["pre_trigger"]["expected_workflows"][path]
         self.assertTrue(expected["default_branch_yaml"]["exists"])
         self.assertEqual(expected["registrations"][0]["state"], "active")
+
+    def test_commit_and_git_tree_paths_can_be_compared_across_checkpoints(self):
+        path = ".github/workflows/attriguard-review.yml"
+        repository = FakeRepository(
+            commit_sha="workflow-commit",
+            workflows=[
+                SimpleNamespace(id=77, name="review", path=path, state="active")
+            ],
+            contents={
+                (path, "main"): SimpleNamespace(
+                    path=path, sha="yaml-sha", size=10, type="file"
+                )
+            },
+        )
+        runner = diagnostic_runner(repository)
+
+        after_deployment = _repository_workflow_state(runner)
+        repository.commit_sha = "scenario-prepare-commit"
+        after_prepare = _repository_workflow_state(runner)
+
+        self.assertEqual(
+            after_deployment["repository"]["default_branch_commit_sha"],
+            "workflow-commit",
+        )
+        self.assertEqual(
+            after_prepare["repository"]["default_branch_commit_sha"],
+            "scenario-prepare-commit",
+        )
+        self.assertTrue(after_deployment["git_tree_paths"][path]["exists"])
+        self.assertEqual(
+            after_deployment["git_tree_paths"][path]["entries"][-1]["sha"],
+            "yaml-sha",
+        )
+        comparison = _workflow_checkpoint_comparison(
+            {
+                "after_workflow_deployment": after_deployment,
+                "after_scenario_prepare": after_prepare,
+            }
+        )
+        self.assertTrue(comparison["default_branch"]["commit_changed"])
+        self.assertFalse(comparison["workflows"][path]["changed"])
 
     def test_pre_trigger_state_records_yaml_registration_actions_and_identity(self):
         path = ".github/workflows/attriguard-review.yml"
@@ -214,6 +311,38 @@ class RepositoryWorkflowStateTests(unittest.TestCase):
             [("GET", "/repos/approved-owner/approved-prefix-123/actions/permissions")],
         )
 
+    def test_pygithub_requester_avoids_missing_github_base_url(self):
+        path = ".github/workflows/attriguard-review.yml"
+        repository = FakeRepository(
+            contents={
+                (path, "main"): SimpleNamespace(
+                    path=path, sha="yaml-sha", size=10, type="file"
+                )
+            }
+        )
+        calls = []
+
+        class Requester:
+            def requestJsonAndCheck(self, method, endpoint):
+                calls.append((method, endpoint))
+                return {}, {"enabled": True, "allowed_actions": "all"}
+
+        client = FakeClient(repository)
+        client.gh = SimpleNamespace(_Github__requester=Requester())
+        client.request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GitHubClient.request must not access Github.base_url")
+        )
+        runner = diagnostic_runner(repository)
+        runner.gh_client = client
+
+        state = _repository_workflow_state(runner)
+
+        self.assertTrue(state["actions_permissions"]["enabled"])
+        self.assertEqual(
+            calls,
+            [("GET", "/repos/approved-owner/approved-prefix-123/actions/permissions")],
+        )
+
     def test_missing_yaml_and_registration_are_recorded_without_mutation(self):
         repository = FakeRepository()
         runner = diagnostic_runner(repository)
@@ -226,7 +355,111 @@ class RepositoryWorkflowStateTests(unittest.TestCase):
         self.assertFalse(expected["default_branch_yaml"]["exists"])
         self.assertEqual(expected["registrations"], [])
         calls = [call[0] for call in repository.read_calls]
-        self.assertEqual(calls, ["get_workflows", "get_contents"])
+        self.assertEqual(
+            calls,
+            [
+                "get_workflows",
+                "get_branch",
+                "get_git_commit",
+                "get_git_tree",
+                "get_contents",
+            ],
+        )
+
+
+class WorkflowDeploymentPathTests(unittest.TestCase):
+    def test_windows_workflow_paths_are_normalized_for_both_conditions(self):
+        for workflow in (
+            "attriguard-gitinject-baseline",
+            "attriguard-gitinject-defended",
+        ):
+            contents = ROOT / "workflows" / workflow / "contents"
+            local = contents / ".github" / "workflows" / "attriguard-review.yml"
+            self.assertTrue(local.is_file())
+            host_relative = os.path.relpath(local, contents)
+            self.assertEqual(
+                _normalize_repository_path(host_relative),
+                ".github/workflows/attriguard-review.yml",
+            )
+
+    def test_custom_client_normalizes_paths_before_official_batch_sync(self):
+        client_type, _ = _build_live_types("approved-owner", "approved-prefix")
+        client = client_type.__new__(client_type)
+        client.workflow_deployment_observer = None
+        captured = []
+
+        def official_batch_sync(
+            _self, additions, deletions, message, branch=None
+        ):
+            captured.append((additions, deletions, message, branch))
+            return True, ""
+
+        with patch.object(GitHubClient, "batch_sync", official_batch_sync):
+            result = client.batch_sync(
+                {r".github\workflows\attriguard-review.yml": "yaml"},
+                [".github\\workflows\\"],
+                "provision workflows",
+                "main",
+            )
+
+        self.assertEqual(result, (True, ""))
+        self.assertEqual(
+            list(captured[0][0]), [".github/workflows/attriguard-review.yml"]
+        )
+        self.assertEqual(captured[0][1], [".github/workflows"])
+
+    def test_normalization_rejects_escape_and_collisions(self):
+        with self.assertRaisesRegex(ValueError, "Unsafe repository path"):
+            _normalize_repository_path(r"..\workflow.yml")
+        with self.assertRaisesRegex(ValueError, "collision"):
+            _normalize_batch_paths(
+                {
+                    r".github\workflows\review.yml": "one",
+                    ".github/workflows/review.yml": "two",
+                },
+                [],
+            )
+
+    def test_missing_workflow_fails_before_trigger_wait(self):
+        path = ".github/workflows/attriguard-review.yml"
+        repository = FakeRepository()
+        _, runner_type = _build_live_types("approved-owner", "approved-prefix")
+        runner = runner_type.__new__(runner_type)
+        runner.repo_name = "approved-owner/approved-prefix-123"
+        runner.gh_client = FakeClient(repository)
+        runner.event_gh_client = runner.gh_client
+        runner._workflow_events = {path: {"pull_request_target"}}
+        runner._workflow_metadata = {}
+        runner._capture_gh_state = lambda _scenario: {}
+
+        with self.assertRaisesRegex(RuntimeError, WORKFLOW_DEPLOYMENT_ERROR):
+            runner._prepare_trial(FakeScenario(), {})
+
+        diagnostic = runner._workflow_diagnostics
+        self.assertEqual(diagnostic["wait_attempts"], [])
+        self.assertFalse(
+            diagnostic["after_scenario_prepare"]["expected_workflows"][path][
+                "default_branch_yaml"
+            ]["exists"]
+        )
+
+    def test_deployment_checkpoint_records_state_and_fails_when_missing(self):
+        path = ".github/workflows/attriguard-review.yml"
+        repository = FakeRepository()
+        _, runner_type = _build_live_types("approved-owner", "approved-prefix")
+        runner = runner_type.__new__(runner_type)
+        runner.repo_name = "approved-owner/approved-prefix-123"
+        runner.gh_client = FakeClient(repository)
+        runner._workflow_events = {path: {"pull_request_target"}}
+
+        with self.assertRaisesRegex(RuntimeError, WORKFLOW_DEPLOYMENT_ERROR):
+            runner._capture_workflow_deployment_checkpoint()
+
+        checkpoint = runner._workflow_diagnostics["after_workflow_deployment"]
+        self.assertEqual(
+            checkpoint["repository"]["default_branch_commit_sha"], "commit-1"
+        )
+        self.assertFalse(checkpoint["git_tree_paths"][path]["exists"])
 
 
 class WorkflowRunFilterDiagnosticTests(unittest.TestCase):
@@ -427,26 +660,76 @@ class TimeoutPersistenceTests(unittest.TestCase):
             }
             self.assertIn("no_workflow_runs_observed", codes)
 
-    def test_timeout_cleanup_is_deferred_if_diagnostic_cannot_be_saved(self):
+    def test_deployment_failure_diagnostic_is_saved_before_cleanup(self):
+        path = ".github/workflows/attriguard-review.yml"
+        repository = FakeRepository()
         _, runner_type = _build_live_types("approved-owner", "approved-prefix")
         runner = runner_type.__new__(runner_type)
-        runner._workflow_diagnostics = {"wait_attempts": []}
-        cleanup_called = []
-        result = {"error": WORKFLOW_WAIT_TIMEOUT, "runs_dir": "unused"}
+        runner.repo_name = "approved-owner/approved-prefix-123"
+        runner.gh_client = FakeClient(repository)
+        runner._workflow_events = {path: {"pull_request_target"}}
+        with self.assertRaisesRegex(RuntimeError, WORKFLOW_DEPLOYMENT_ERROR):
+            runner._capture_workflow_deployment_checkpoint()
+        cleanup_observations = []
 
-        with patch(
-            "run_official_gitinject_trial._persist_workflow_diagnostic",
-            side_effect=OSError("disk unavailable"),
-        ), patch.object(
-            BenchmarkRunner,
-            "_cleanup",
-            lambda *_args, **_kwargs: cleanup_called.append(True),
+        with tempfile.TemporaryDirectory() as temporary:
+            result = {
+                "error": f"Sync workflows: {WORKFLOW_DEPLOYMENT_ERROR}",
+                "runs_dir": temporary,
+            }
+
+            def observe_cleanup(_self, _scenario, _result, _context):
+                cleanup_observations.append(
+                    (Path(temporary) / "workflow_diagnostic.json").exists()
+                )
+
+            with patch.object(BenchmarkRunner, "_cleanup", observe_cleanup):
+                runner._cleanup(None, result, context=SimpleNamespace())
+
+            diagnostic = json.loads(
+                (Path(temporary) / "workflow_diagnostic.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(cleanup_observations, [True])
+            self.assertIn("after_workflow_deployment", diagnostic)
+            codes = {
+                signal["code"]
+                for signal in diagnostic["possible_cause_signals"]
+            }
+            self.assertIn("workflow_yaml_missing_on_default_branch", codes)
+
+    def test_timeout_cleanup_is_deferred_if_diagnostic_cannot_be_saved(self):
+        for error_message in (
+            WORKFLOW_WAIT_TIMEOUT,
+            f"Sync workflows: {WORKFLOW_DEPLOYMENT_ERROR}",
         ):
-            runner._cleanup(FakeScenario(), result, context=SimpleNamespace())
+            with self.subTest(error_message=error_message):
+                _, runner_type = _build_live_types(
+                    "approved-owner", "approved-prefix"
+                )
+                runner = runner_type.__new__(runner_type)
+                runner._workflow_diagnostics = {"wait_attempts": []}
+                cleanup_called = []
+                result = {"error": error_message, "runs_dir": "unused"}
 
-        self.assertEqual(cleanup_called, [])
-        self.assertTrue(result["cleanup_deferred"])
-        self.assertIn("disk unavailable", result["workflow_diagnostic_error"])
+                with patch(
+                    "run_official_gitinject_trial._persist_workflow_diagnostic",
+                    side_effect=OSError("disk unavailable"),
+                ), patch.object(
+                    BenchmarkRunner,
+                    "_cleanup",
+                    lambda *_args, **_kwargs: cleanup_called.append(True),
+                ):
+                    runner._cleanup(
+                        FakeScenario(), result, context=SimpleNamespace()
+                    )
+
+                self.assertEqual(cleanup_called, [])
+                self.assertTrue(result["cleanup_deferred"])
+                self.assertIn(
+                    "disk unavailable", result["workflow_diagnostic_error"]
+                )
 
 
 if __name__ == "__main__":
