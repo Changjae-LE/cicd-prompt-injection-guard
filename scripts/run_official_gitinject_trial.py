@@ -9,6 +9,7 @@ official cleanup sequence to continue.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from hashlib import sha256
 from itertools import islice
 import json
@@ -40,6 +41,7 @@ from attriguard_gitinject.github_actions_integration import (  # noqa: E402
 REPOSITORY_ID_VARIABLE = "ATTRIGUARD_BENCHMARK_REPOSITORY_ID"
 REPOSITORY_ID_SENTINEL = "__BIND_GITINJECT_CREATED_REPOSITORY_ID__"
 WORKFLOWS = {"attriguard-gitinject-baseline", "attriguard-gitinject-defended"}
+WORKFLOW_WAIT_TIMEOUT = "Timed out waiting for workflow run or could not find it."
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
@@ -190,14 +192,58 @@ def _prepare_trial_with_safe_workflow_runs(
     runner._trial_state = state
 
 
-def _wait_for_run_with_safe_workflow_runs(
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _diagnostic_error(error: Exception) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "type": type(error).__name__,
+        "message": _sanitize_traceback(str(error)),
+    }
+    status = getattr(error, "status", None)
+    if isinstance(status, int):
+        result["status"] = status
+    return result
+
+
+def _workflow_run_snapshot(run: Any, exclusion: str | None) -> dict[str, Any]:
+    created_at = getattr(run, "created_at", None)
+    pull_requests = getattr(run, "pull_requests", None) or []
+    status = getattr(run, "status", None)
+    conclusion = getattr(run, "conclusion", None)
+    approval_state = None
+    if conclusion == "action_required":
+        approval_state = "approval_required"
+    elif status == "waiting":
+        approval_state = "waiting_for_approval_or_environment"
+    return {
+        "id": getattr(run, "id", None),
+        "workflow_id": getattr(run, "workflow_id", None),
+        "name": getattr(run, "name", None),
+        "event": getattr(run, "event", None),
+        "path": getattr(run, "path", None),
+        "status": status,
+        "conclusion": conclusion,
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+        "pull_request_numbers": [getattr(pr, "number", None) for pr in pull_requests],
+        "head_branch": getattr(run, "head_branch", None),
+        "head_sha": getattr(run, "head_sha", None),
+        "excluded_by": exclusion,
+        "eligible": exclusion is None,
+        "approval_state": approval_state,
+    }
+
+
+def _evaluate_workflow_runs(
     runner: Any,
     start_time: float,
-    expected_event: str | None = None,
-) -> tuple[int, Any] | None:
-    """GitInject 0.1.0 ``_wait_for_run`` with only empty-run slicing fixed."""
+    expected_event: str | None,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Apply the official 0.1.0 attribution filters and describe each decision."""
 
     candidates = []
+    observed_runs = []
     events = {expected_event} if expected_event else None
     if expected_event in {"pull_request", "pull_request_target"}:
         events = {"pull_request", "pull_request_target"}
@@ -210,22 +256,328 @@ def _wait_for_run_with_safe_workflow_runs(
         else islice(runner.gh_client.repository.get_workflow_runs(), 100)
     )
     for run in runs:
+        exclusion = None
         if run.id in getattr(runner, "_baseline_run_ids", set()):
-            continue
-        if run.created_at.timestamp() < start_time:
-            continue
-        if events and run.event not in events:
-            continue
-        if workflows is not None:
+            exclusion = "baseline_run_id"
+        elif run.created_at.timestamp() < start_time:
+            exclusion = "created_before_trigger"
+        elif events and run.event not in events:
+            exclusion = "unexpected_event"
+        elif workflows is not None:
             path = run.path.split("@", 1)[0]
-            if path not in workflows or run.event not in workflows[path]:
-                continue
+            if path not in workflows:
+                exclusion = "workflow_path_not_tracked"
+            elif run.event not in workflows[path]:
+                exclusion = "event_not_registered_for_workflow_path"
         pr_number = state.get("pr_number")
-        if pr_number and run.pull_requests and not any(
-            pr.number == pr_number for pr in run.pull_requests
+        if (
+            exclusion is None
+            and pr_number
+            and run.pull_requests
+            and not any(pr.number == pr_number for pr in run.pull_requests)
         ):
-            continue
-        candidates.append(run)
+            exclusion = "pull_request_number_mismatch"
+        if exclusion is None:
+            candidates.append(run)
+        observed_runs.append(_workflow_run_snapshot(run, exclusion))
+
+    if len(candidates) > 1:
+        decision = "ambiguous_candidates"
+    elif not candidates:
+        decision = "no_candidate"
+    elif candidates[0].status != "completed":
+        decision = "candidate_not_completed"
+    else:
+        decision = "completed_candidate"
+    return candidates, {
+        "captured_at": _utc_now(),
+        "start_time": start_time,
+        "expected_event": expected_event,
+        "accepted_events": sorted(events) if events else None,
+        "expected_pr_number": state.get("pr_number"),
+        "expected_run_id": expected_id,
+        "tracked_workflows": (
+            {path: sorted(values) for path, values in workflows.items()}
+            if workflows is not None
+            else None
+        ),
+        "decision": decision,
+        "runs": observed_runs,
+    }
+
+
+def _record_wait_observation(runner: Any, observation: dict[str, Any]) -> None:
+    recorder = getattr(runner, "_record_workflow_wait_observation", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(observation)
+    except Exception as error:
+        errors = getattr(runner, "_workflow_diagnostic_observer_errors", None)
+        if errors is None:
+            errors = []
+            runner._workflow_diagnostic_observer_errors = errors
+        errors.append(_diagnostic_error(error))
+
+
+def _repository_workflow_state(runner: Any) -> dict[str, Any]:
+    """Collect read-only repository, Actions, YAML, and workflow registration state."""
+
+    captured: dict[str, Any] = {
+        "captured_at": _utc_now(),
+        "repository": {"name": getattr(runner, "repo_name", None)},
+        "actions_permissions": {},
+        "registered_workflows": [],
+        "expected_workflows": {},
+    }
+    expected = {
+        path: sorted(events)
+        for path, events in (getattr(runner, "_workflow_events", None) or {}).items()
+    }
+    repository = None
+    try:
+        repository = runner.gh_client.repository
+        actual_id = getattr(repository, "id", None)
+        bound_id = getattr(runner.gh_client, "bound_repository_id", None)
+        default_branch = getattr(repository, "default_branch", None)
+        captured["repository"].update(
+            {
+                "id": actual_id,
+                "bound_id": bound_id,
+                "identity_matches": (
+                    actual_id == bound_id if bound_id is not None else None
+                ),
+                "default_branch": default_branch,
+            }
+        )
+    except Exception as error:
+        captured["repository"]["error"] = _diagnostic_error(error)
+
+    try:
+        response = runner.gh_client.request(
+            "GET", f"/repos/{runner.repo_name}/actions/permissions"
+        )
+        permissions = response.json()
+        captured["actions_permissions"] = {
+            key: permissions.get(key)
+            for key in ("enabled", "allowed_actions", "selected_actions_url")
+            if key in permissions
+        }
+    except Exception as error:
+        captured["actions_permissions"] = {"error": _diagnostic_error(error)}
+
+    registered_by_path: dict[str, list[dict[str, Any]]] = {}
+    if repository is not None:
+        try:
+            for workflow in islice(repository.get_workflows(), 100):
+                item = {
+                    "id": getattr(workflow, "id", None),
+                    "name": getattr(workflow, "name", None),
+                    "path": getattr(workflow, "path", None),
+                    "state": getattr(workflow, "state", None),
+                }
+                captured["registered_workflows"].append(item)
+                path = str(item["path"] or "").split("@", 1)[0]
+                registered_by_path.setdefault(path, []).append(item)
+        except Exception as error:
+            captured["registered_workflows_error"] = _diagnostic_error(error)
+
+    default_branch = captured["repository"].get("default_branch")
+    for path, events in expected.items():
+        yaml_state: dict[str, Any]
+        if repository is None or not default_branch:
+            yaml_state = {"exists": None, "error": "repository or default branch unavailable"}
+        else:
+            try:
+                content = repository.get_contents(path, ref=default_branch)
+                yaml_state = {
+                    "exists": True,
+                    "path": getattr(content, "path", path),
+                    "sha": getattr(content, "sha", None),
+                    "size": getattr(content, "size", None),
+                    "type": getattr(content, "type", None),
+                }
+            except Exception as error:
+                yaml_state = {
+                    "exists": False if getattr(error, "status", None) == 404 else None,
+                    "error": _diagnostic_error(error),
+                }
+        captured["expected_workflows"][path] = {
+            "events": events,
+            "default_branch_yaml": yaml_state,
+            "registrations": registered_by_path.get(path, []),
+        }
+    return captured
+
+
+def _initialize_workflow_diagnostic(runner: Any) -> None:
+    runner._workflow_diagnostics = {
+        "schema_version": "causentry_gitinject_workflow_diagnostic_v1",
+        "created_at": _utc_now(),
+        "pre_trigger": _repository_workflow_state(runner),
+        "wait_attempts": [],
+    }
+
+
+def _workflow_diagnostic_signals(diagnostic: dict[str, Any]) -> list[dict[str, Any]]:
+    state = diagnostic.get("timeout_repository_state") or diagnostic.get("pre_trigger") or {}
+    signals: list[dict[str, Any]] = []
+    permissions = state.get("actions_permissions", {})
+    if state.get("repository", {}).get("identity_matches") is False:
+        signals.append({"code": "repository_identity_mismatch"})
+    if permissions.get("enabled") is False:
+        signals.append({"code": "repository_actions_disabled"})
+    for path, expected in state.get("expected_workflows", {}).items():
+        yaml_state = expected.get("default_branch_yaml", {})
+        if yaml_state.get("exists") is False:
+            signals.append({"code": "workflow_yaml_missing_on_default_branch", "path": path})
+        registrations = expected.get("registrations", [])
+        if not registrations:
+            signals.append({"code": "workflow_not_registered", "path": path})
+        for workflow in registrations:
+            if workflow.get("state") != "active":
+                signals.append(
+                    {
+                        "code": "workflow_disabled",
+                        "path": path,
+                        "workflow_id": workflow.get("id"),
+                        "state": workflow.get("state"),
+                    }
+                )
+
+    attempts = list(diagnostic.get("wait_attempts", []))
+    timeout_snapshot = diagnostic.get("timeout_run_snapshot")
+    if isinstance(timeout_snapshot, dict):
+        attempts.append(timeout_snapshot)
+    runs = [run for attempt in attempts for run in attempt.get("runs", [])]
+    if not runs:
+        signals.append({"code": "no_workflow_runs_observed"})
+    else:
+        approval_runs = [
+            run for run in runs if run.get("approval_state") is not None
+        ]
+        if approval_runs:
+            signals.append(
+                {
+                    "code": "workflow_approval_waiting",
+                    "run_ids": sorted(
+                        {run.get("id") for run in approval_runs if run.get("id") is not None}
+                    ),
+                    "states": sorted(
+                        {run["approval_state"] for run in approval_runs}
+                    ),
+                }
+            )
+        eligible = [run for run in runs if run.get("eligible")]
+        if not eligible:
+            reasons = sorted(
+                {run.get("excluded_by") for run in runs if run.get("excluded_by")}
+            )
+            signals.append(
+                {"code": "all_observed_runs_filtered", "filter_reasons": reasons}
+            )
+        elif not any(run.get("status") == "completed" for run in eligible):
+            signals.append(
+                {
+                    "code": "matching_workflow_run_not_completed",
+                    "run_ids": sorted(
+                        {run.get("id") for run in eligible if run.get("id") is not None}
+                    ),
+                }
+            )
+    if isinstance(timeout_snapshot, dict) and any(
+        run.get("eligible") and run.get("status") == "completed"
+        for run in timeout_snapshot.get("runs", [])
+    ):
+        signals.append({"code": "matching_completed_run_observed_at_timeout_cleanup"})
+    workflow_query_error = any(
+        expected.get("default_branch_yaml", {}).get("error")
+        for expected in state.get("expected_workflows", {}).values()
+    )
+    timeout_query_error = (
+        isinstance(timeout_snapshot, dict) and timeout_snapshot.get("error")
+    )
+    if any(
+        isinstance(value, dict) and value.get("error")
+        for value in (
+            state.get("repository", {}),
+            state.get("actions_permissions", {}),
+        )
+    ) or any(
+        (
+            state.get("registered_workflows_error"),
+            workflow_query_error,
+            timeout_query_error,
+        )
+    ):
+        signals.append({"code": "diagnostic_query_error"})
+    return signals
+
+
+def _persist_workflow_diagnostic(
+    runner: Any,
+    result: dict[str, Any],
+    scenario: Any,
+) -> Path | None:
+    diagnostic = getattr(runner, "_workflow_diagnostics", None)
+    if not isinstance(diagnostic, dict) or not result.get("runs_dir"):
+        return None
+    is_timeout = result.get("error") == WORKFLOW_WAIT_TIMEOUT
+    diagnostic["result_error"] = result.get("error")
+    diagnostic["captured_before_cleanup_at"] = _utc_now()
+    diagnostic["observer_errors"] = list(
+        getattr(runner, "_workflow_diagnostic_observer_errors", [])
+    )
+    if is_timeout:
+        diagnostic["timeout_repository_state"] = _repository_workflow_state(runner)
+        start_time = getattr(runner, "_trial_state", {}).get("triggered_at")
+        expected_event = None
+        if scenario is not None:
+            expected_event = scenario.get_event().get("event_type")
+        if start_time is not None:
+            try:
+                _, snapshot = _evaluate_workflow_runs(
+                    runner, start_time, expected_event
+                )
+                diagnostic["timeout_run_snapshot"] = snapshot
+            except Exception as error:
+                diagnostic["timeout_run_snapshot"] = {
+                    "captured_at": _utc_now(),
+                    "error": _diagnostic_error(error),
+                    "runs": [],
+                }
+    diagnostic["possible_cause_signals"] = _workflow_diagnostic_signals(diagnostic)
+    path = Path(result["runs_dir"]) / "workflow_diagnostic.json"
+    _write_json_exclusive(path, diagnostic)
+    result["workflow_diagnostic"] = str(path)
+    return path
+
+
+def _wait_for_run_with_safe_workflow_runs(
+    runner: Any,
+    start_time: float,
+    expected_event: str | None = None,
+) -> tuple[int, Any] | None:
+    """GitInject 0.1.0 ``_wait_for_run`` with only empty-run slicing fixed."""
+
+    try:
+        candidates, observation = _evaluate_workflow_runs(
+            runner, start_time, expected_event
+        )
+    except Exception as error:
+        _record_wait_observation(
+            runner,
+            {
+                "captured_at": _utc_now(),
+                "start_time": start_time,
+                "expected_event": expected_event,
+                "decision": "query_error",
+                "error": _diagnostic_error(error),
+                "runs": [],
+            },
+        )
+        raise
+    _record_wait_observation(runner, observation)
     if len(candidates) > 1:
         raise RuntimeError(
             "Ambiguous workflow attribution: multiple runs match this trigger"
@@ -258,7 +610,30 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
 
     class EvidenceCollectingBenchmarkRunner(BenchmarkRunner):
         def _prepare_trial(self, scenario, metadata=None):
-            return _prepare_trial_with_safe_workflow_runs(self, scenario, metadata)
+            result = _prepare_trial_with_safe_workflow_runs(self, scenario, metadata)
+            try:
+                _initialize_workflow_diagnostic(self)
+            except Exception as error:
+                self._workflow_diagnostics = {
+                    "schema_version": "causentry_gitinject_workflow_diagnostic_v1",
+                    "created_at": _utc_now(),
+                    "pre_trigger": {"error": _diagnostic_error(error)},
+                    "wait_attempts": [],
+                }
+            return result
+
+        def _record_workflow_wait_observation(self, observation):
+            diagnostic = getattr(self, "_workflow_diagnostics", None)
+            if not isinstance(diagnostic, dict):
+                diagnostic = {
+                    "schema_version": "causentry_gitinject_workflow_diagnostic_v1",
+                    "created_at": _utc_now(),
+                    "wait_attempts": [],
+                }
+                self._workflow_diagnostics = diagnostic
+            attempts = diagnostic.setdefault("wait_attempts", [])
+            observation["attempt"] = len(attempts) + 1
+            attempts.append(observation)
 
         @retry(
             retry=retry_if_result(lambda res: res is None),
@@ -290,6 +665,16 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
             return result
 
         def _cleanup(self, scenario, result, context):
+            is_timeout = result.get("error") == WORKFLOW_WAIT_TIMEOUT
+            try:
+                _persist_workflow_diagnostic(self, result, scenario)
+            except Exception as error:
+                result["workflow_diagnostic_error"] = (
+                    f"{type(error).__name__}: {_sanitize_traceback(str(error))}"
+                )
+                if is_timeout:
+                    result["cleanup_deferred"] = True
+                    return
             run_id = result.get("run_id")
             repository_id = getattr(self.gh_client, "bound_repository_id", None)
             if run_id and repository_id:
