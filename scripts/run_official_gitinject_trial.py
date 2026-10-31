@@ -190,9 +190,55 @@ def _prepare_trial_with_safe_workflow_runs(
     runner._trial_state = state
 
 
+def _wait_for_run_with_safe_workflow_runs(
+    runner: Any,
+    start_time: float,
+    expected_event: str | None = None,
+) -> tuple[int, Any] | None:
+    """GitInject 0.1.0 ``_wait_for_run`` with only empty-run slicing fixed."""
+
+    candidates = []
+    events = {expected_event} if expected_event else None
+    if expected_event in {"pull_request", "pull_request_target"}:
+        events = {"pull_request", "pull_request_target"}
+    workflows = getattr(runner, "_workflow_events", None)
+    state = getattr(runner, "_trial_state", {})
+    expected_id = getattr(runner, "_expected_run_id", None)
+    runs = (
+        [runner.gh_client.repository.get_workflow_run(expected_id)]
+        if expected_id
+        else islice(runner.gh_client.repository.get_workflow_runs(), 100)
+    )
+    for run in runs:
+        if run.id in getattr(runner, "_baseline_run_ids", set()):
+            continue
+        if run.created_at.timestamp() < start_time:
+            continue
+        if events and run.event not in events:
+            continue
+        if workflows is not None:
+            path = run.path.split("@", 1)[0]
+            if path not in workflows or run.event not in workflows[path]:
+                continue
+        pr_number = state.get("pr_number")
+        if pr_number and run.pull_requests and not any(
+            pr.number == pr_number for pr in run.pull_requests
+        ):
+            continue
+        candidates.append(run)
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "Ambiguous workflow attribution: multiple runs match this trigger"
+        )
+    if not candidates or candidates[0].status != "completed":
+        return None
+    return candidates[0].id, candidates[0]
+
+
 def _build_live_types(expected_owner: str, expected_prefix: str):
     from gitinject.runner import BenchmarkRunner
     from gitinject.utils.gh_client import GitHubClient
+    from tenacity import retry, retry_if_result, stop_after_attempt, wait_exponential
 
     class IdentityBindingGitHubClient(GitHubClient):
         bound_repository_id: int | None = None
@@ -213,6 +259,19 @@ def _build_live_types(expected_owner: str, expected_prefix: str):
     class EvidenceCollectingBenchmarkRunner(BenchmarkRunner):
         def _prepare_trial(self, scenario, metadata=None):
             return _prepare_trial_with_safe_workflow_runs(self, scenario, metadata)
+
+        @retry(
+            retry=retry_if_result(lambda res: res is None),
+            stop=stop_after_attempt(60),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            retry_error_callback=lambda state: None,
+        )
+        def _wait_for_run(self, start_time, expected_event=None):
+            return _wait_for_run_with_safe_workflow_runs(
+                self,
+                start_time,
+                expected_event=expected_event,
+            )
 
         def run(self, *args, **kwargs):
             result, failure = _call_with_swallowed_exception_trace(
