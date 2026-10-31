@@ -18,8 +18,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from attriguard_gitinject.attriguard_cicd import (  # noqa: E402
     AttriGuardIntegrationError,
     GITINJECT_FAITHFUL_SYSTEM_MESSAGE,
+    assess_trial_validity,
+    canonical_sha256,
     file_sha256,
     load_json_document,
+    validate_trial_receipt,
 )
 from attriguard_gitinject.artifact_collection import (  # noqa: E402
     collect_gitinject_artifact,
@@ -33,7 +36,10 @@ from attriguard_gitinject.github_actions_integration import (  # noqa: E402
     load_official_gitinject_manifest,
     validate_benchmark_repository,
 )
-from run_gitinject_github_action import _action_error_receipt  # noqa: E402
+from run_gitinject_github_action import (  # noqa: E402
+    _action_error_receipt,
+    _finalize_live_receipt,
+)
 from verify_gitinject_integration import (  # noqa: E402
     TEMP_ENVIRONMENT,
     _load_yaml,
@@ -56,6 +62,91 @@ def official_event(repository="bench-owner/ag-bench-0001", repository_id=424242)
             "base": {"sha": "1" * 40},
             "head": {"sha": "2" * 40},
         },
+    }
+
+
+def unhashed_live_receipt():
+    payload_hash = "f7353675929c6d795e0bb3639ef556ccee929aa28a76d725363e8efaff24f0b6"
+    return {
+        "schema_version": "causentry_attriguard_gitinject_trial_v3",
+        "benchmark_id": "gitinject",
+        "configuration": "baseline",
+        "condition": "attack",
+        "environment_mode": "gitinject_faithful",
+        "input_contract": {
+            "comparison_fingerprint": "test-fingerprint",
+            "model_visible_pull_request": {
+                "title": "review",
+                "description": "fixture",
+                "changed_paths": [
+                    "CLAUDE.md",
+                    "src/flask/csrf.py",
+                    "tests/test_csrf.py",
+                ],
+            },
+            "visible_files": {
+                "CLAUDE.md": payload_hash,
+                "src/flask/csrf.py": (
+                    "fa8ff34edcf8dcd8598d771d439a93f0794751261cb72da6f3813082d08bcf7c"
+                ),
+                "tests/test_csrf.py": (
+                    "9a0d4bb1a85c38934d7120f2db7debebdf7aee338ab61e5bbdf6772a968f5f3a"
+                ),
+            },
+        },
+        "attriguard_artifact": {
+            "core_byte_identical": True,
+            "core_sha256": (
+                "6d28e2208efbd521bf3f2e90c553e57b11c786e65564eababacb8cdf4f8050d8"
+            ),
+        },
+        "evidence": {
+            "injection_expected": True,
+            "injection_exposed": False,
+            "observations": [],
+            "actions": [
+                {
+                    "sequence": 1,
+                    "tool": "post_review",
+                    "execution": "remote_executed",
+                }
+            ],
+        },
+        "evaluation": {
+            "upstream_gitinject": {
+                "status": "not_run",
+                "result": None,
+            }
+        },
+        "outcome": {
+            "execution_status": "finished",
+            "utility_achieved": None,
+            "security_breached": None,
+            "content_manipulation_succeeded": None,
+            "unauthorized_action_succeeded": None,
+            "upstream_gitinject_result": None,
+        },
+        "performance": {"agent_execution_latency_ms": 10.0},
+        "defense_trace": {
+            "schema_version": "causentry_attriguard_defense_trace_v1",
+            "target_calls": [
+                {
+                    "sequence": 1,
+                    "role": "target",
+                    "call_kind": "primary",
+                    "input_tool_content_sha256": [],
+                    "output_tool_calls": [
+                        {
+                            "id": "call-review",
+                            "function": "post_review",
+                            "args": {"body": "Review body"},
+                        }
+                    ],
+                }
+            ],
+            "final_decisions": [],
+        },
+        "transcript": [],
     }
 
 
@@ -95,6 +186,57 @@ class OfficialGitInjectPinTests(unittest.TestCase):
             self.skipTest("ignored local GitInject wheel is not present")
         manifest = load_official_gitinject_manifest()
         self.assertEqual(file_sha256(wheel), manifest["package"]["wheel"]["sha256"])
+
+
+class LiveReceiptFinalizationTests(unittest.TestCase):
+    def test_integration_metadata_is_added_before_final_receipt_hash(self):
+        receipt = unhashed_live_receipt()
+        receipt["receipt_sha256"] = canonical_sha256(receipt)
+        finalized = _finalize_live_receipt(
+            receipt,
+            {
+                "package_version": "0.1.0",
+                "scenario": "supply_chain_malicious_code",
+                "run_id": "12345",
+                "official_evaluator_status": "deferred_to_gitinject_controller",
+            },
+        )
+
+        payload = dict(finalized)
+        declared_hash = payload.pop("receipt_sha256")
+        self.assertIn("gitinject_official_integration", payload)
+        self.assertEqual(declared_hash, canonical_sha256(payload))
+        validate_trial_receipt(finalized)
+
+    def test_finalized_live_receipt_passes_local_validity_gate(self):
+        receipt = _finalize_live_receipt(
+            unhashed_live_receipt(),
+            {
+                "package_version": "0.1.0",
+                "scenario": "supply_chain_malicious_code",
+                "run_id": "12345",
+                "official_evaluator_status": "deferred_to_gitinject_controller",
+            },
+        )
+        validity = assess_trial_validity(receipt)
+        self.assertTrue(validity["gate_passed"])
+        self.assertEqual(validity["gate_status"], "valid_completed")
+        self.assertEqual(validity["errors"], [])
+
+    def test_any_field_added_after_finalization_invalidates_receipt(self):
+        receipt = _finalize_live_receipt(
+            unhashed_live_receipt(),
+            {
+                "package_version": "0.1.0",
+                "scenario": "supply_chain_malicious_code",
+            },
+        )
+        receipt["late_field"] = "not-covered-by-declared-hash"
+        with self.assertRaisesRegex(
+            AttriGuardIntegrationError,
+            "Trial receipt SHA-256 does not match its content",
+        ):
+            validate_trial_receipt(receipt)
 
 
 class WorkflowContractTests(unittest.TestCase):

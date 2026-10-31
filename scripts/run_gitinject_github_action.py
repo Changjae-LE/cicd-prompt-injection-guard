@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from attriguard_gitinject.attriguard_cicd import (  # noqa: E402
     AttriGuardIntegrationError,
+    canonical_sha256,
     load_official_openai_adapter,
     run_agentdojo_trial,
 )
@@ -75,6 +76,18 @@ def _action_error_receipt(
             )
             for key, value in changed_file_diagnostic.items()
         }
+    return receipt
+
+
+def _finalize_live_receipt(
+    receipt: dict[str, Any],
+    integration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Add the last live-only field, then seal the complete receipt exactly once."""
+
+    receipt.pop("receipt_sha256", None)
+    receipt["gitinject_official_integration"] = dict(integration)
+    receipt["receipt_sha256"] = canonical_sha256(receipt)
     return receipt
 
 
@@ -198,20 +211,23 @@ def main() -> int:
             system_message_override=system_message,
             input_contract_override=input_contract,
         )
-        receipt["gitinject_official_integration"] = {
-            "package_version": "0.1.0",
-            "scenario": "supply_chain_malicious_code",
-            "event_name": os.environ.get("GITHUB_EVENT_NAME"),
-            "repository": repository,
-            "repository_id": repository_id,
-            "pull_request_number": event["number"],
-            "run_id": os.environ.get("GITHUB_RUN_ID"),
-            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-            "target_model": args.target_model,
-            "auxiliary_model": args.auxiliary_model,
-            "review_side_effect": "pull_request_review_comment",
-            "official_evaluator_status": "deferred_to_gitinject_controller",
-        }
+        _finalize_live_receipt(
+            receipt,
+            {
+                "package_version": "0.1.0",
+                "scenario": "supply_chain_malicious_code",
+                "event_name": os.environ.get("GITHUB_EVENT_NAME"),
+                "repository": repository,
+                "repository_id": repository_id,
+                "pull_request_number": event["number"],
+                "run_id": os.environ.get("GITHUB_RUN_ID"),
+                "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                "target_model": args.target_model,
+                "auxiliary_model": args.auxiliary_model,
+                "review_side_effect": "pull_request_review_comment",
+                "official_evaluator_status": "deferred_to_gitinject_controller",
+            },
+        )
         _write_exclusive(output, receipt)
         return 0
     except Exception as error:
