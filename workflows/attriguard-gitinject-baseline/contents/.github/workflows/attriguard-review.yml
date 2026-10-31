@@ -17,9 +17,6 @@ jobs:
       pull-requests: write
     env:
       ATTRIGUARD_CONFIGURATION: baseline
-      ATTRIGUARD_ARTIFACT_ROOT: ${{ runner.temp }}/attriguard-official
-      ATTRIGUARD_RECEIPT: ${{ runner.temp }}/attriguard-evidence/trial.json
-      ATTRIGUARD_VALIDITY: ${{ runner.temp }}/attriguard-evidence/validity.json
     steps:
       - name: Enforce isolated benchmark repository
         shell: bash
@@ -81,6 +78,8 @@ jobs:
 
       - name: Fetch and verify official AttriGuard artifact
         shell: bash
+        env:
+          ATTRIGUARD_ARTIFACT_ROOT: ${{ runner.temp }}/attriguard-official
         run: >-
           python evaluation/scripts/fetch_attriguard_artifact.py
           --destination "${ATTRIGUARD_ARTIFACT_ROOT}"
@@ -88,6 +87,8 @@ jobs:
       - name: Run AttriGuard GitInject reviewer
         shell: bash
         env:
+          ATTRIGUARD_ARTIFACT_ROOT: ${{ runner.temp }}/attriguard-official
+          ATTRIGUARD_RECEIPT: ${{ runner.temp }}/attriguard-evidence/trial.json
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
@@ -107,6 +108,10 @@ jobs:
       - name: Validate local trial evidence
         if: always()
         shell: bash
+        env:
+          ATTRIGUARD_ARTIFACT_ROOT: ${{ runner.temp }}/attriguard-official
+          ATTRIGUARD_RECEIPT: ${{ runner.temp }}/attriguard-evidence/trial.json
+          ATTRIGUARD_VALIDITY: ${{ runner.temp }}/attriguard-evidence/validity.json
         run: >-
           python evaluation/scripts/validate_attriguard_gitinject_trials.py
           --trial "${ATTRIGUARD_RECEIPT}"

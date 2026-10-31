@@ -29,7 +29,11 @@ from attriguard_gitinject.github_actions_integration import (  # noqa: E402
     load_official_gitinject_manifest,
     validate_benchmark_repository,
 )
-from verify_gitinject_integration import verify_integration  # noqa: E402
+from verify_gitinject_integration import (  # noqa: E402
+    TEMP_ENVIRONMENT,
+    _load_yaml,
+    verify_integration,
+)
 
 
 CASE = ROOT / "dataset" / "gitinject" / "cases" / "supply_chain_malicious_code"
@@ -136,6 +140,114 @@ class WorkflowContractTests(unittest.TestCase):
             "ATTRIGUARD_CONFIGURATION: defended", "ATTRIGUARD_CONFIGURATION: X"
         )
         self.assertEqual(baseline, defended)
+
+    def test_runner_context_is_scoped_to_supported_step_fields(self):
+        for workflow_id, configuration in (
+            ("attriguard-gitinject-baseline", "baseline"),
+            ("attriguard-gitinject-defended", "defended"),
+        ):
+            path = (
+                ROOT
+                / "workflows"
+                / workflow_id
+                / "contents/.github/workflows/attriguard-review.yml"
+            )
+            document = _load_yaml(path)
+            job = document["jobs"]["review"]
+            self.assertEqual(
+                job["env"], {"ATTRIGUARD_CONFIGURATION": configuration}
+            )
+            steps = {step["name"]: step for step in job["steps"]}
+            self.assertEqual(
+                steps["Fetch and verify official AttriGuard artifact"]["env"],
+                {
+                    "ATTRIGUARD_ARTIFACT_ROOT": TEMP_ENVIRONMENT[
+                        "ATTRIGUARD_ARTIFACT_ROOT"
+                    ]
+                },
+            )
+            reviewer_env = steps["Run AttriGuard GitInject reviewer"]["env"]
+            self.assertEqual(
+                {
+                    name: reviewer_env[name]
+                    for name in ("ATTRIGUARD_ARTIFACT_ROOT", "ATTRIGUARD_RECEIPT")
+                },
+                {
+                    name: TEMP_ENVIRONMENT[name]
+                    for name in ("ATTRIGUARD_ARTIFACT_ROOT", "ATTRIGUARD_RECEIPT")
+                },
+            )
+            self.assertEqual(
+                steps["Validate local trial evidence"]["env"],
+                TEMP_ENVIRONMENT,
+            )
+
+            runner_context_locations = []
+
+            def walk(value, location=()):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        walk(item, (*location, str(key)))
+                elif isinstance(value, list):
+                    for index, item in enumerate(value):
+                        walk(item, (*location, str(index)))
+                elif "${{ runner." in str(value):
+                    runner_context_locations.append(location)
+
+            walk(document)
+            self.assertTrue(runner_context_locations)
+            self.assertTrue(
+                all(
+                    len(location) >= 6
+                    and location[:3] == ("jobs", "review", "steps")
+                    and location[4] in {"env", "with"}
+                    for location in runner_context_locations
+                )
+            )
+            self.assertEqual(
+                path.read_text(encoding="utf-8").count("${{ runner.temp }}"),
+                8,
+            )
+
+    def test_artifact_upload_and_security_boundaries_remain_unchanged(self):
+        for workflow_id in (
+            "attriguard-gitinject-baseline",
+            "attriguard-gitinject-defended",
+        ):
+            path = (
+                ROOT
+                / "workflows"
+                / workflow_id
+                / "contents/.github/workflows/attriguard-review.yml"
+            )
+            document = _load_yaml(path)
+            self.assertIn("pull_request_target", document["on"])
+            job = document["jobs"]["review"]
+            self.assertEqual(
+                job["permissions"], {"contents": "read", "pull-requests": "write"}
+            )
+            steps = {step["name"]: step for step in job["steps"]}
+            self.assertEqual(
+                steps["Check out trusted evaluation harness"]["with"]["path"],
+                "evaluation",
+            )
+            self.assertEqual(
+                steps["Check out untrusted pull request as data"]["with"]["path"],
+                "target",
+            )
+            reviewer_env = steps["Run AttriGuard GitInject reviewer"]["env"]
+            self.assertEqual(
+                reviewer_env["OPENAI_API_KEY"], "${{ secrets.OPENAI_API_KEY }}"
+            )
+            upload = steps["Upload local evidence separately"]
+            self.assertEqual(upload["if"], "always()")
+            self.assertEqual(upload["with"]["if-no-files-found"], "error")
+            self.assertEqual(upload["with"]["retention-days"], "30")
+            self.assertEqual(
+                upload["with"]["path"],
+                "${{ runner.temp }}/attriguard-evidence/trial.json\n"
+                "${{ runner.temp }}/attriguard-evidence/validity.json\n",
+            )
 
     def test_official_runner_wrapper_defaults_to_no_network_plan_mode(self):
         completed = subprocess.run(

@@ -32,6 +32,11 @@ ACTION_PINS = {
     "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
     "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
 }
+TEMP_ENVIRONMENT = {
+    "ATTRIGUARD_ARTIFACT_ROOT": "${{ runner.temp }}/attriguard-official",
+    "ATTRIGUARD_RECEIPT": "${{ runner.temp }}/attriguard-evidence/trial.json",
+    "ATTRIGUARD_VALIDITY": "${{ runner.temp }}/attriguard-evidence/validity.json",
+}
 PARITY_METADATA_FIELDS = {
     "category",
     "provider",
@@ -109,13 +114,49 @@ def _verify_workflow(
     if job.get("permissions") != {"contents": "read", "pull-requests": "write"}:
         raise AttriGuardIntegrationError(f"{workflow_id}: permissions are not minimal/equal")
     env = job.get("env")
-    if not isinstance(env, Mapping) or env.get("ATTRIGUARD_CONFIGURATION") != expected_configuration:
+    if (
+        not isinstance(env, Mapping)
+        or env.get("ATTRIGUARD_CONFIGURATION") != expected_configuration
+    ):
         raise AttriGuardIntegrationError(f"{workflow_id}: configuration selector mismatch")
+    invalid_job_context = {
+        name: value
+        for name, value in env.items()
+        if "${{ runner." in str(value)
+    }
+    if invalid_job_context:
+        raise AttriGuardIntegrationError(
+            f"{workflow_id}: runner context is invalid in jobs.review.env"
+        )
 
     steps = _workflow_steps(document)
     step_names = [step.get("name") for step in steps]
     if step_names.count("Run AttriGuard GitInject reviewer") != 1:
         raise AttriGuardIntegrationError(f"{workflow_id}: agent invocation step mismatch")
+    steps_by_name = {step.get("name"): step for step in steps}
+    required_step_env = {
+        "Fetch and verify official AttriGuard artifact": {
+            "ATTRIGUARD_ARTIFACT_ROOT": TEMP_ENVIRONMENT[
+                "ATTRIGUARD_ARTIFACT_ROOT"
+            ],
+        },
+        "Run AttriGuard GitInject reviewer": {
+            "ATTRIGUARD_ARTIFACT_ROOT": TEMP_ENVIRONMENT[
+                "ATTRIGUARD_ARTIFACT_ROOT"
+            ],
+            "ATTRIGUARD_RECEIPT": TEMP_ENVIRONMENT["ATTRIGUARD_RECEIPT"],
+        },
+        "Validate local trial evidence": TEMP_ENVIRONMENT,
+    }
+    for step_name, required in required_step_env.items():
+        step = steps_by_name.get(step_name)
+        step_env = step.get("env") if isinstance(step, Mapping) else None
+        if not isinstance(step_env, Mapping) or any(
+            step_env.get(name) != value for name, value in required.items()
+        ):
+            raise AttriGuardIntegrationError(
+                f"{workflow_id}: temporary path contract mismatch in step {step_name}"
+            )
     uses = [step.get("uses") for step in steps if step.get("uses")]
     for action, digest in ACTION_PINS.items():
         expected = f"{action}@{digest}"
