@@ -34,17 +34,30 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_GITINJECT_MANIFEST = (
     ROOT / "dataset" / "gitinject" / "official_gitinject_manifest.json"
 )
+DEFAULT_GITINJECT_SCENARIO_REGISTRY = (
+    ROOT / "dataset" / "gitinject" / "official_scenario_registry.json"
+)
 _NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+SUPPORTED_GITINJECT_SCENARIOS = frozenset(
+    {"supply_chain_malicious_code", "vulnerable_code_review"}
+)
 
 
 class ChangedFileSetMismatchError(AttriGuardIntegrationError):
     """Exact official changed-file contract mismatch, with paths-only evidence."""
 
-    def __init__(self, *, expected: Sequence[str], observed: Sequence[str]):
+    def __init__(
+        self,
+        *,
+        expected: Sequence[str],
+        observed: Sequence[str],
+        scenario_id: str = "supply_chain_malicious_code",
+    ):
         expected_set = set(expected)
         observed_set = set(observed)
         self.changed_file_diagnostic = {
             "schema_version": "causentry_gitinject_changed_file_validation_v1",
+            "scenario_id": scenario_id,
             "matches_official_scenario": False,
             "expected_paths": sorted(expected_set),
             "observed_paths": sorted(observed_set),
@@ -52,15 +65,106 @@ class ChangedFileSetMismatchError(AttriGuardIntegrationError):
             "extra_paths": sorted(observed_set - expected_set),
             "contains_file_contents": False,
         }
-        super().__init__(
-            "Changed-file set does not match official supply_chain_malicious_code"
+        super().__init__(f"Changed-file set does not match official {scenario_id}")
+
+
+def _validate_scenario_contract(
+    scenario_id: str,
+    scenario: Mapping[str, Any],
+) -> None:
+    if scenario.get("id") != scenario_id:
+        raise AttriGuardIntegrationError(
+            f"Official GitInject scenario ID mismatch: {scenario_id}"
         )
+    if scenario.get("type") not in {"benign", "malicious"}:
+        raise AttriGuardIntegrationError(
+            f"Official GitInject scenario type is invalid: {scenario_id}"
+        )
+    if scenario.get("condition") not in {"attack", "benign"}:
+        raise AttriGuardIntegrationError(
+            f"Official GitInject scenario condition is invalid: {scenario_id}"
+        )
+    expected_condition = "attack" if scenario.get("type") == "malicious" else "benign"
+    if scenario.get("condition") != expected_condition:
+        raise AttriGuardIntegrationError(
+            f"Official GitInject scenario type/condition mismatch: {scenario_id}"
+        )
+    if scenario.get("category") != "code-review" or scenario.get("event") != "pull_request":
+        raise AttriGuardIntegrationError(
+            f"Official GitInject scenario workflow contract is invalid: {scenario_id}"
+        )
+    if not re.fullmatch(r"[0-9a-f]{64}", str(scenario.get("scenario_sha256", ""))):
+        raise AttriGuardIntegrationError(
+            f"Official GitInject scenario hash is invalid: {scenario_id}"
+        )
+    changed_files = scenario.get("changed_files")
+    if not isinstance(changed_files, Mapping) or not changed_files:
+        raise AttriGuardIntegrationError(
+            f"Official GitInject changed-file pin is missing: {scenario_id}"
+        )
+    normalized_paths: set[str] = set()
+    for path, digest in changed_files.items():
+        normalized = GitInjectCICDWorkspace._normalize_repo_path(str(path))
+        if normalized != path or normalized in normalized_paths:
+            raise AttriGuardIntegrationError(
+                f"Official GitInject changed-file path is invalid: {path}"
+            )
+        normalized_paths.add(normalized)
+        if not re.fullmatch(r"[0-9a-f]{64}", str(digest)):
+            raise AttriGuardIntegrationError(
+                f"Official GitInject changed-file hash is invalid: {path}"
+            )
+    for evaluator_name in ("utility_evaluator", "security_evaluator"):
+        evaluator = scenario.get(evaluator_name)
+        if not isinstance(evaluator, Mapping) or not str(
+            evaluator.get("implementation", "")
+        ).startswith("gitinject.evaluators."):
+            raise AttriGuardIntegrationError(
+                f"Official GitInject {evaluator_name} pin is invalid: {scenario_id}"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", str(evaluator.get("source_sha256", ""))):
+            raise AttriGuardIntegrationError(
+                f"Official GitInject {evaluator_name} hash is invalid: {scenario_id}"
+            )
+    if scenario.get("type") == "benign":
+        pull_request = scenario.get("pull_request")
+        if (
+            not isinstance(pull_request, Mapping)
+            or not isinstance(pull_request.get("title"), str)
+            or not isinstance(pull_request.get("body"), str)
+            or not isinstance(scenario.get("user_task"), str)
+            or scenario.get("payload_sha256") is not None
+        ):
+            raise AttriGuardIntegrationError(
+                f"Official benign GitInject input contract is invalid: {scenario_id}"
+            )
+
+
+def get_official_scenario_contract(
+    manifest: Mapping[str, Any],
+    scenario_id: str,
+) -> dict[str, Any]:
+    scenarios = manifest.get("supported_scenarios")
+    if not isinstance(scenarios, Mapping) or scenario_id not in scenarios:
+        raise AttriGuardIntegrationError(
+            f"Unsupported official GitInject scenario: {scenario_id}"
+        )
+    scenario = scenarios[scenario_id]
+    if not isinstance(scenario, Mapping):
+        raise AttriGuardIntegrationError(
+            f"Official GitInject scenario contract is invalid: {scenario_id}"
+        )
+    _validate_scenario_contract(scenario_id, scenario)
+    return copy.deepcopy(dict(scenario))
 
 
 def load_official_gitinject_manifest(
     path: str | Path = DEFAULT_GITINJECT_MANIFEST,
+    *,
+    registry_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    manifest = load_json_document(path)
+    manifest_path = Path(path)
+    manifest = load_json_document(manifest_path)
     if manifest.get("schema_version") != "causentry_official_gitinject_manifest_v1":
         raise AttriGuardIntegrationError("Unsupported official GitInject manifest")
     package = manifest.get("package")
@@ -88,6 +192,39 @@ def load_official_gitinject_manifest(
             raise AttriGuardIntegrationError(
                 f"Official GitInject changed-file hash is invalid: {path}"
             )
+    resolved_registry_path = (
+        Path(registry_path)
+        if registry_path is not None
+        else manifest_path.with_name(DEFAULT_GITINJECT_SCENARIO_REGISTRY.name)
+    )
+    registry = load_json_document(resolved_registry_path)
+    if (
+        registry.get("schema_version")
+        != "causentry_official_gitinject_scenario_registry_v1"
+        or registry.get("gitinject_version") != package.get("version")
+    ):
+        raise AttriGuardIntegrationError(
+            "Official GitInject scenario registry is incompatible"
+        )
+    supported = registry.get("scenarios")
+    if not isinstance(supported, Mapping) or set(supported) != set(
+        SUPPORTED_GITINJECT_SCENARIOS
+    ):
+        raise AttriGuardIntegrationError(
+            "Official GitInject supported-scenario pins are incomplete"
+        )
+    manifest["supported_scenarios"] = copy.deepcopy(dict(supported))
+    for scenario_id in sorted(SUPPORTED_GITINJECT_SCENARIOS):
+        contract = get_official_scenario_contract(manifest, scenario_id)
+        if scenario_id == "supply_chain_malicious_code" and (
+            contract.get("scenario_sha256") != scenario.get("scenario_sha256")
+            or contract.get("payload_sha256") != scenario.get("payload_sha256")
+            or contract.get("changed_files") != scenario.get("changed_files")
+        ):
+            raise AttriGuardIntegrationError(
+                "Legacy supply-chain pin differs from its supported-scenario contract"
+            )
+    manifest["supported_scenarios_sha256"] = file_sha256(resolved_registry_path)
     return manifest
 
 
@@ -370,10 +507,12 @@ def build_live_gitinject_workspace(
     action_sink: GitHubReviewCommentSink,
     changed_paths: Sequence[str] | None = None,
     case_root: str | Path = DEFAULT_SUPPLY_CHAIN_CASE,
+    scenario_id: str = "supply_chain_malicious_code",
 ) -> tuple[GitInjectCICDWorkspace, str, str, dict[str, Any]]:
     """Bind the official scenario checkout to the existing AgentDojo adapter."""
 
     manifest = load_official_gitinject_manifest()
+    scenario_contract = get_official_scenario_contract(manifest, scenario_id)
     root = Path(repository_root).resolve(strict=True)
     pull_request_event = event.get("pull_request")
     repository = event.get("repository")
@@ -386,16 +525,27 @@ def build_live_gitinject_workspace(
             "Event repository ID and provisioner-bound repository ID differ"
         )
 
-    fixture_root = Path(case_root).resolve(strict=True)
-    fixture = load_json_document(fixture_root / "fixture_manifest.json")
-    metadata = fixture.get("merge_request_metadata")
-    if not isinstance(metadata, Mapping):
-        raise AttriGuardIntegrationError("Pinned GitInject fixture metadata is missing")
+    fixture_root: Path | None = None
+    fixture: Mapping[str, Any] | None = None
+    if scenario_id == "supply_chain_malicious_code":
+        fixture_root = Path(case_root).resolve(strict=True)
+        fixture = load_json_document(fixture_root / "fixture_manifest.json")
+        metadata = fixture.get("merge_request_metadata")
+        expected_title = metadata.get("title") if isinstance(metadata, Mapping) else None
+        expected_body = (
+            metadata.get("description") if isinstance(metadata, Mapping) else None
+        )
+    else:
+        metadata = scenario_contract.get("pull_request")
+        expected_title = metadata.get("title") if isinstance(metadata, Mapping) else None
+        expected_body = metadata.get("body") if isinstance(metadata, Mapping) else None
+    if not isinstance(metadata, Mapping) or not isinstance(expected_title, str) or not isinstance(expected_body, str):
+        raise AttriGuardIntegrationError("Pinned GitInject scenario metadata is missing")
     title = pull_request_event.get("title")
     body = pull_request_event.get("body")
-    if title != metadata.get("title") or body != metadata.get("description"):
+    if title != expected_title or body != expected_body:
         raise AttriGuardIntegrationError(
-            "GitHub event does not match the pinned supply_chain_malicious_code scenario"
+            f"GitHub event does not match the pinned {scenario_id} scenario"
         )
 
     if changed_paths is None:
@@ -404,12 +554,13 @@ def build_live_gitinject_workspace(
             base_sha=_event_sha(pull_request_event, "base"),
             head_sha=_event_sha(pull_request_event, "head"),
         )
-    expected_changed_files = manifest["scenario"]["changed_files"]
+    expected_changed_files = scenario_contract["changed_files"]
     observed_changed_paths = sorted(set(changed_paths))
     if set(observed_changed_paths) != set(expected_changed_files):
         raise ChangedFileSetMismatchError(
             expected=tuple(expected_changed_files),
             observed=observed_changed_paths,
+            scenario_id=scenario_id,
         )
     normalized = sorted(
         {
@@ -443,38 +594,49 @@ def build_live_gitinject_workspace(
             + ", ".join(sorted(mismatches))
         )
 
-    expected_payload_hash = manifest["scenario"]["payload_sha256"]
-    if visible_files.get("CLAUDE.md") != expected_payload_hash:
-        raise AttriGuardIntegrationError("Official GitInject attack payload SHA-256 mismatch")
-    source_manifest = load_json_document(fixture_root / "source_manifest.json")
-    artifacts = source_manifest.get("artifacts")
-    scenario_artifact = next(
-        (
-            item
-            for item in artifacts
-            if isinstance(item, Mapping) and item.get("role") == "scenario_definition"
-        ),
-        None,
-    ) if isinstance(artifacts, list) else None
-    if not isinstance(scenario_artifact, Mapping) or scenario_artifact.get(
-        "preserved_sha256"
-    ) != manifest["scenario"]["scenario_sha256"]:
-        raise AttriGuardIntegrationError("Pinned GitInject scenario source SHA-256 mismatch")
+    if scenario_id == "supply_chain_malicious_code":
+        expected_payload_hash = scenario_contract["payload_sha256"]
+        if visible_files.get("CLAUDE.md") != expected_payload_hash:
+            raise AttriGuardIntegrationError(
+                "Official GitInject attack payload SHA-256 mismatch"
+            )
+        assert fixture_root is not None
+        source_manifest = load_json_document(fixture_root / "source_manifest.json")
+        artifacts = source_manifest.get("artifacts")
+        scenario_artifact = next(
+            (
+                item
+                for item in artifacts
+                if isinstance(item, Mapping)
+                and item.get("role") == "scenario_definition"
+            ),
+            None,
+        ) if isinstance(artifacts, list) else None
+        if not isinstance(scenario_artifact, Mapping) or scenario_artifact.get(
+            "preserved_sha256"
+        ) != scenario_contract["scenario_sha256"]:
+            raise AttriGuardIntegrationError(
+                "Pinned GitInject scenario source SHA-256 mismatch"
+            )
 
     model_visible_pull_request = {
         "title": title,
         "description": body,
         "changed_paths": normalized,
     }
-    user_task = fixture.get("benign_user_request")
+    user_task = (
+        fixture.get("benign_user_request")
+        if fixture is not None
+        else scenario_contract.get("user_task")
+    )
     if not isinstance(user_task, str) or not user_task:
         raise AttriGuardIntegrationError("Pinned benign review objective is missing")
     input_contract: dict[str, Any] = {
         "benchmark_id": "gitinject",
-        "source_case_id": "supply_chain_malicious_code",
+        "source_case_id": scenario_id,
         "official_gitinject_version": manifest["package"]["version"],
         "official_gitinject_manifest_sha256": file_sha256(DEFAULT_GITINJECT_MANIFEST),
-        "condition": "attack",
+        "condition": scenario_contract["condition"],
         "environment_mode": "gitinject_faithful",
         "configuration_excluded_from_model_input": True,
         "condition_label_excluded_from_model_input": True,
@@ -484,10 +646,24 @@ def build_live_gitinject_workspace(
         "system_message_sha256": sha256(
             GITINJECT_FAITHFUL_SYSTEM_MESSAGE.encode("utf-8")
         ).hexdigest(),
-        "fixture_manifest_sha256": file_sha256(fixture_root / "fixture_manifest.json"),
         "file_lookup_contract": copy.deepcopy(FILE_LOOKUP_CONTRACT),
         "visible_files": visible_files,
     }
+    if scenario_id == "supply_chain_malicious_code":
+        assert fixture_root is not None
+        input_contract["fixture_manifest_sha256"] = file_sha256(
+            fixture_root / "fixture_manifest.json"
+        )
+    else:
+        input_contract["official_scenario_registry_sha256"] = manifest[
+            "supported_scenarios_sha256"
+        ]
+        input_contract["official_scenario_sha256"] = scenario_contract[
+            "scenario_sha256"
+        ]
+        input_contract["official_utility_evaluator"] = copy.deepcopy(
+            scenario_contract["utility_evaluator"]
+        )
     input_contract["comparison_fingerprint"] = canonical_sha256(input_contract)
     workspace = GitInjectCICDWorkspace(
         repository_root=root,
@@ -513,6 +689,25 @@ def bind_official_and_local_results(
         key in analysis
         for key in ("security_breached", "utility_achieved", "autonomy_achieved")
     )
+    local_validity_item: Mapping[str, Any] | None = None
+    if isinstance(local_validity, Mapping):
+        if local_validity.get("schema_version") == "causentry_attriguard_gitinject_trial_validity_v1":
+            local_validity_item = local_validity
+        reports = local_validity.get("reports")
+        if local_validity_item is None and isinstance(reports, list) and len(reports) == 1:
+            report = reports[0]
+            candidate = report.get("validity") if isinstance(report, Mapping) else None
+            if isinstance(candidate, Mapping):
+                local_validity_item = candidate
+    review_state = None
+    task_completed = None
+    if isinstance(local_validity_item, Mapping):
+        review = local_validity_item.get("review_action")
+        execution = local_validity_item.get("execution_contract")
+        review_state = review.get("state") if isinstance(review, Mapping) else None
+        task_completed = (
+            execution.get("task_completed") if isinstance(execution, Mapping) else None
+        )
     result = {
         "schema_version": "causentry_gitinject_result_binding_v1",
         "source_case_id": local_receipt.get("source_case_id"),
@@ -521,6 +716,21 @@ def bind_official_and_local_results(
         "local_validity_gate": copy.deepcopy(local_validity),
         "official_gitinject_evaluator_executed": official_evaluator_executed,
         "official_gitinject_result": copy.deepcopy(dict(official_result)),
+        "outcome_separation": {
+            "official_utility_achieved": (
+                analysis.get("utility_achieved")
+                if isinstance(analysis, Mapping)
+                and isinstance(analysis.get("utility_achieved"), bool)
+                else None
+            ),
+            "local_task_completed": task_completed,
+            "local_review_action_state": review_state,
+            "normal_action_blocked_by_defense": (
+                review_state == "review_action_blocked_by_defense"
+                if isinstance(review_state, str)
+                else None
+            ),
+        },
         "separation_policy": (
             "Official GitInject verdicts are preserved verbatim; Trial Validity Gate "
             "metrics are not substituted for official ASR."

@@ -1,0 +1,25 @@
+{
+  "schema_version": "causentry_gitinject_controlled_exposure_manifest_v1",
+  "experiment_id": "gitinject_controlled_exposure_v1",
+  "separation_policy": "Results are separate from official GitInject natural-exposure metrics.",
+  "official_gitinject": {
+    "version": "0.1.0",
+    "scenario": "supply_chain_malicious_code",
+    "scenario_sha256": "744334f2b9427463316fa327a754ca9e29a965c3b846a4c08b3e9c7e6f315fb9",
+    "evaluator": "gitinject.evaluators.LLMEvaluator",
+    "evaluator_sha256": "816625069418cc5b157d5848adda4305a2752c812a933f356a0c558371468353"
+  },
+  "source_observation": {
+    "requested_resource": "CLAUDE.md",
+    "canonical_resource": "repo://CLAUDE.md",
+    "payload_sha256": "f7353675929c6d795e0bb3639ef556ccee929aa28a76d725363e8efaff24f0b6",
+    "intervention": "read_file_before_first_target_inference",
+    "boundary": "agentdojo_tool_execution"
+  },
+  "immutability": {
+    "system_message_modified": false,
+    "user_task_modified": false,
+    "payload_modified": false,
+    "attriguard_core_modified": false
+  }
+}

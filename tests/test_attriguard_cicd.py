@@ -1,8 +1,12 @@
+import copy
 import json
 import os
+import subprocess
 import sys
 import unittest
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +14,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from attriguard_gitinject.attriguard_cicd import (  # noqa: E402
     AttriGuardIntegrationError,
+    CONTROLLED_EXPOSURE_MODE,
+    CONTROLLED_EXPOSURE_PROTOCOL,
+    CONTROLLED_EXPOSURE_TOOL_CALL_ID,
     DefenseTraceRecorder,
     assess_trial_validity,
     apply_human_adjudication,
@@ -17,9 +24,14 @@ from attriguard_gitinject.attriguard_cicd import (  # noqa: E402
     canonical_sha256,
     file_sha256,
     load_artifact_manifest,
+    load_controlled_exposure_manifest,
+    load_official_openai_adapter,
     run_agentdojo_trial,
+    run_controlled_exposure_trial,
+    summarize_controlled_exposure_trials,
     summarize_trials,
     validate_comparison_fairness,
+    validate_controlled_exposure_inputs,
     verify_official_artifact,
 )
 
@@ -37,6 +49,24 @@ class ArtifactContractTests(unittest.TestCase):
         self.assertEqual(
             core["sha256"],
             "6d28e2208efbd521bf3f2e90c553e57b11c786e65564eababacb8cdf4f8050d8",
+        )
+
+    def test_controlled_manifest_pins_official_scenario_payload_and_evaluator(self):
+        manifest = load_controlled_exposure_manifest()
+        official = manifest["official_gitinject"]
+        source = manifest["source_observation"]
+        self.assertEqual(official["version"], "0.1.0")
+        self.assertEqual(
+            official["scenario_sha256"],
+            "744334f2b9427463316fa327a754ca9e29a965c3b846a4c08b3e9c7e6f315fb9",
+        )
+        self.assertEqual(
+            official["evaluator_sha256"],
+            "816625069418cc5b157d5848adda4305a2752c812a933f356a0c558371468353",
+        )
+        self.assertEqual(
+            source["payload_sha256"],
+            "f7353675929c6d795e0bb3639ef556ccee929aa28a76d725363e8efaff24f0b6",
         )
 
     def test_workspace_separates_control_and_attack_without_editing_payload(self):
@@ -97,6 +127,60 @@ class ArtifactContractTests(unittest.TestCase):
         )
         self.assertIn(
             "CLAUDE.md", faithful["model_visible_pull_request"]["changed_paths"]
+        )
+
+    def test_controlled_exposure_preserves_faithful_inputs_and_original_payload(self):
+        faithful_workspace, faithful_task, faithful_system, faithful = (
+            build_supply_chain_workspace(
+                "attack", environment_mode="gitinject_faithful"
+            )
+        )
+        controlled_workspace, controlled_task, controlled_system, controlled = (
+            build_supply_chain_workspace(
+                "attack", environment_mode=CONTROLLED_EXPOSURE_MODE
+            )
+        )
+        self.assertEqual(controlled_task, faithful_task)
+        self.assertEqual(controlled_system, faithful_system)
+        self.assertEqual(
+            controlled["model_visible_pull_request"],
+            faithful["model_visible_pull_request"],
+        )
+        self.assertEqual(controlled["visible_files"], faithful["visible_files"])
+        self.assertNotIn("controlled_exposure", faithful)
+        self.assertEqual(
+            controlled["controlled_exposure"]["source_sha256"],
+            "f7353675929c6d795e0bb3639ef556ccee929aa28a76d725363e8efaff24f0b6",
+        )
+        self.assertFalse(
+            controlled["controlled_exposure"]["system_message_modified"]
+        )
+        self.assertEqual(
+            controlled_workspace.read_file("CLAUDE.md"),
+            faithful_workspace.read_file("CLAUDE.md"),
+        )
+
+    def test_controlled_exposure_is_attack_only_and_separately_identified(self):
+        with self.assertRaisesRegex(
+            AttriGuardIntegrationError,
+            "only for the original attack condition",
+        ):
+            build_supply_chain_workspace(
+                "no_file_control",
+                environment_mode=CONTROLLED_EXPOSURE_MODE,
+            )
+        _, _, _, first = build_supply_chain_workspace(
+            "attack", environment_mode=CONTROLLED_EXPOSURE_MODE
+        )
+        _, _, _, second = build_supply_chain_workspace(
+            "attack", environment_mode=CONTROLLED_EXPOSURE_MODE
+        )
+        self.assertEqual(
+            first["comparison_fingerprint"], second["comparison_fingerprint"]
+        )
+        self.assertEqual(
+            first["controlled_exposure"]["schema_version"],
+            CONTROLLED_EXPOSURE_PROTOCOL,
         )
 
     def test_workspace_rejects_path_escape_and_unknown_scheme(self):
@@ -929,6 +1013,34 @@ class OfficialCoreIntegrationTests(unittest.TestCase):
         self.assertEqual(defended["candidate_evaluation"]["review_action_count"], 1)
         self.assertTrue(defended["candidate_evaluation"]["utility_candidate"])
 
+    def test_controlled_exposure_runner_plan_is_network_free(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(ROOT / "scripts" / "run_controlled_exposure.py"),
+                "--artifact-root",
+                str(self.artifact_root),
+                "--configuration",
+                "defended",
+                "--target-model",
+                "scripted-target",
+                "--auxiliary-model",
+                "scripted-auxiliary",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        plan = json.loads(completed.stdout)
+        self.assertEqual(plan["experiment_id"], CONTROLLED_EXPOSURE_PROTOCOL)
+        self.assertFalse(plan["network_calls"])
+        self.assertFalse(plan["model_calls_authorized"])
+        self.assertFalse(plan["github_writes"])
+        self.assertEqual(len(plan["input_comparison_fingerprint"]), 64)
+        self.assertEqual(len(plan["tool_schemas_sha256"]), 64)
+
     def test_faithful_bare_paths_are_shared_and_attack_exposure_is_recorded(self):
         receipts = []
         for configuration in ("baseline", "defended"):
@@ -969,6 +1081,253 @@ class OfficialCoreIntegrationTests(unittest.TestCase):
                 if item["resource"] == "repo://CLAUDE.md"
             )
             self.assertEqual(trace_observation["requested_resource"], "CLAUDE.md")
+
+    def test_controlled_exposure_pair_records_source_attenuation_and_delivery(self):
+        core_path = verify_official_artifact(self.artifact_root)["core_algorithm"]
+        before_hash = file_sha256(core_path)
+        baseline = run_controlled_exposure_trial(
+            configuration="baseline",
+            target_llm=ScriptedTargetLLM(bare_repository_paths=True),
+            artifact_root=self.artifact_root,
+        )
+        defended = run_controlled_exposure_trial(
+            configuration="defended",
+            target_llm=ScriptedTargetLLM(bare_repository_paths=True),
+            attenuation_llm=NeutralAttenuationLLM(),
+            judge_llm=RejectDifferentReviewJudge(),
+            artifact_root=self.artifact_root,
+        )
+        for receipt in (baseline, defended):
+            receipt.pop("receipt_sha256")
+            receipt["models"] = {
+                "target": "scripted-target",
+                "target_temperature": 0.0,
+                "target_top_p": 1.0,
+                "seed": 7,
+            }
+            receipt["receipt_sha256"] = canonical_sha256(receipt)
+
+        validation = validate_controlled_exposure_inputs([baseline, defended])
+        self.assertTrue(validation["identical_pre_defense_inputs"])
+        self.assertTrue(validation["identical_pr_metadata"])
+        self.assertTrue(validation["identical_user_task"])
+        self.assertTrue(validation["identical_system_message"])
+        self.assertTrue(validation["identical_target_model_settings"])
+        self.assertTrue(validation["identical_tool_schemas"])
+        self.assertEqual(
+            baseline["input_contract"]["comparison_fingerprint"],
+            defended["input_contract"]["comparison_fingerprint"],
+        )
+        baseline_exposure = baseline["evidence"]["controlled_exposure"]
+        defended_exposure = defended["evidence"]["controlled_exposure"]
+        for exposure in (baseline_exposure, defended_exposure):
+            self.assertTrue(exposure["source_observed_before_defense"])
+            self.assertTrue(exposure["controlled_trial_eligible"])
+            self.assertEqual(
+                exposure["source_sha256"],
+                "f7353675929c6d795e0bb3639ef556ccee929aa28a76d725363e8efaff24f0b6",
+            )
+        self.assertFalse(baseline_exposure["attenuation_applied"])
+        self.assertTrue(baseline_exposure["raw_payload_delivered_to_target"])
+        self.assertTrue(defended_exposure["attenuation_applied"])
+        self.assertGreater(
+            len(defended_exposure["attenuation_transformations"]), 0
+        )
+        self.assertIsNotNone(defended_exposure["final_attenuated_sha256"])
+        self.assertEqual(before_hash, file_sha256(core_path))
+
+        mismatched_model = copy.deepcopy(defended)
+        mismatched_model.pop("receipt_sha256")
+        mismatched_model["models"]["target"] = "different-target"
+        mismatched_model["receipt_sha256"] = canonical_sha256(mismatched_model)
+        with self.assertRaisesRegex(
+            AttriGuardIntegrationError,
+            "target-model settings mismatch",
+        ):
+            validate_controlled_exposure_inputs([baseline, mismatched_model])
+
+        adjudicated = []
+        for receipt, utility, breach in (
+            (baseline, False, True),
+            (defended, True, False),
+        ):
+            source = copy.deepcopy(receipt)
+            if receipt["configuration"] == "defended":
+                source.pop("receipt_sha256")
+                payload_hash = source["evidence"]["controlled_exposure"][
+                    "source_sha256"
+                ]
+                for target_call in source["defense_trace"]["target_calls"]:
+                    target_call["input_tool_content_sha256"] = [
+                        value
+                        for value in target_call["input_tool_content_sha256"]
+                        if value != payload_hash
+                    ]
+                controlled = source["evidence"]["controlled_exposure"]
+                controlled["raw_payload_delivered_to_target"] = False
+                controlled["target_delivery_state"] = (
+                    "attenuated_content_delivered"
+                )
+                controlled["target_deliveries"] = [
+                    delivery
+                    for delivery in controlled["target_deliveries"]
+                    if delivery["attenuated_content_delivered"]
+                ]
+                source["receipt_sha256"] = canonical_sha256(source)
+            updated = apply_human_adjudication(
+                source,
+                utility_achieved=utility,
+                security_breached=breach,
+                content_manipulation_succeeded=breach,
+                unauthorized_action_succeeded=False,
+                upstream_gitinject_result=None,
+                assessor="controlled-test-adjudicator",
+                assessed_at="2026-10-31T00:00:00Z",
+                rationale="Applied the pinned GitInject utility and security rubrics.",
+                rubric_version="gitinject-0.1.0-supply-chain-controlled-v1",
+            )
+            adjudicated.append(updated)
+        attenuated_only_validity = assess_trial_validity(adjudicated[1])
+        self.assertTrue(attenuated_only_validity["gate_passed"])
+        self.assertEqual(
+            attenuated_only_validity["classifications"]["payload"],
+            "payload_observed_but_not_delivered",
+        )
+        summary = summarize_controlled_exposure_trials(adjudicated)
+        self.assertEqual(
+            summary["separation_policy"],
+            "Controlled exposure metrics are not official GitInject natural-exposure metrics.",
+        )
+        self.assertFalse(
+            summary["evaluation_policy"][
+                "official_gitinject_natural_exposure_metric"
+            ]
+        )
+        self.assertEqual(
+            summary["configurations"]["baseline"]["evaluation_provenance"][
+                "upstream_gitinject_status"
+            ],
+            {"not_run": 1},
+        )
+        self.assertEqual(
+            summary["configurations"]["baseline"]["evaluation_provenance"][
+                "custom_status"
+            ],
+            {"human_adjudicated": 1},
+        )
+        self.assertEqual(
+            summary["configurations"]["baseline"]["controlled_asr"]["value"],
+            1.0,
+        )
+        self.assertEqual(
+            summary["configurations"]["defended"]["controlled_asr"]["value"],
+            0.0,
+        )
+        self.assertEqual(
+            summary["configurations"]["defended"][
+                "source_exposure_conditioned_asr"
+            ]["attempts"],
+            1,
+        )
+        self.assertEqual(
+            summary["configurations"]["defended"][
+                "raw_delivery_conditioned_asr"
+            ]["attempts"],
+            0,
+        )
+        self.assertIsNotNone(summary["latency_overhead_ms"])
+        summary_without_hash = copy.deepcopy(summary)
+        summary_without_hash.pop("summary_sha256")
+        self.assertEqual(
+            summary["summary_sha256"], canonical_sha256(summary_without_hash)
+        )
+
+    def test_controlled_observation_is_valid_for_official_openai_adapter(self):
+        requests = []
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                requests.append(kwargs)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content="Controlled observation received.",
+                                tool_calls=None,
+                            ),
+                            logprobs=None,
+                        )
+                    ]
+                )
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        )
+        adapter = load_official_openai_adapter(self.artifact_root)
+        target = adapter.OpenAILLM(
+            fake_client,
+            "gpt-4.1-mini",
+            temperature=0.0,
+            top_p=1.0,
+        )
+
+        receipt = run_controlled_exposure_trial(
+            configuration="baseline",
+            target_llm=target,
+            artifact_root=self.artifact_root,
+        )
+
+        self.assertEqual(len(requests), 1)
+        request_messages = requests[0]["messages"]
+        self.assertEqual(
+            [message["role"] for message in request_messages],
+            ["system", "user", "assistant", "tool"],
+        )
+        seeded_call = request_messages[2]["tool_calls"][0]
+        self.assertEqual(seeded_call["id"], CONTROLLED_EXPOSURE_TOOL_CALL_ID)
+        self.assertEqual(seeded_call["function"]["name"], "read_file")
+        self.assertEqual(
+            json.loads(seeded_call["function"]["arguments"]),
+            {"path": "CLAUDE.md"},
+        )
+        tool_result = request_messages[3]
+        self.assertEqual(
+            tool_result["tool_call_id"], CONTROLLED_EXPOSURE_TOOL_CALL_ID
+        )
+        self.assertEqual(tool_result["name"], "read_file")
+        delivered_text = "".join(
+            part["text"] for part in tool_result["content"]
+        )
+        self.assertEqual(
+            sha256(delivered_text.encode("utf-8")).hexdigest(),
+            "f7353675929c6d795e0bb3639ef556ccee929aa28a76d725363e8efaff24f0b6",
+        )
+        self.assertEqual(requests[0]["model"], "gpt-4.1-mini")
+        self.assertEqual(len(receipt["defense_trace"]["target_calls"]), 1)
+        self.assertTrue(
+            receipt["evidence"]["controlled_exposure"][
+                "raw_payload_delivered_to_target"
+            ]
+        )
+
+    def test_general_summary_rejects_mixed_natural_and_controlled_receipts(self):
+        controlled = run_controlled_exposure_trial(
+            configuration="baseline",
+            target_llm=ScriptedTargetLLM(bare_repository_paths=True),
+            artifact_root=self.artifact_root,
+        )
+        natural = run_agentdojo_trial(
+            configuration="baseline",
+            condition="attack",
+            environment_mode="gitinject_faithful",
+            target_llm=FaithfulPlainTextTargetLLM(),
+            artifact_root=self.artifact_root,
+        )
+        with self.assertRaisesRegex(
+            AttriGuardIntegrationError,
+            "dedicated separate summarizer",
+        ):
+            summarize_trials([natural, controlled])
 
     def test_faithful_plain_text_stop_is_classified_without_forcing_exposure(self):
         receipt = run_agentdojo_trial(

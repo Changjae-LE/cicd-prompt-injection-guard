@@ -89,12 +89,14 @@ jobs:
         env:
           ATTRIGUARD_ARTIFACT_ROOT: ${{ runner.temp }}/attriguard-official
           ATTRIGUARD_RECEIPT: ${{ runner.temp }}/attriguard-evidence/trial.json
+          ATTRIGUARD_GITINJECT_SCENARIO: ${{ vars.ATTRIGUARD_GITINJECT_SCENARIO }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
           python evaluation/scripts/run_gitinject_github_action.py
           --execute-live
           --configuration "${ATTRIGUARD_CONFIGURATION}"
+          --scenario "${ATTRIGUARD_GITINJECT_SCENARIO}"
           --repository-root "${GITHUB_WORKSPACE}/target"
           --event-path "${GITHUB_EVENT_PATH}"
           --artifact-root "${ATTRIGUARD_ARTIFACT_ROOT}"

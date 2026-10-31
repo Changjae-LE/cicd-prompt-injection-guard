@@ -27,7 +27,9 @@ from attriguard_gitinject.attriguard_cicd import (  # noqa: E402
 )
 from attriguard_gitinject.github_actions_integration import (  # noqa: E402
     GitHubReviewCommentSink,
+    SUPPORTED_GITINJECT_SCENARIOS,
     build_live_gitinject_workspace,
+    get_official_scenario_contract,
     load_official_gitinject_manifest,
     load_pull_request_event,
     validate_benchmark_repository,
@@ -57,10 +59,12 @@ def _safe_error(error: Exception) -> str:
 def _action_error_receipt(
     configuration: str | None,
     error: Exception,
+    scenario: str | None = None,
 ) -> dict[str, Any]:
     receipt: dict[str, Any] = {
         "schema_version": "causentry_gitinject_action_error_v1",
         "configuration": configuration,
+        "scenario": scenario,
         "stage": "github_action_agent_invocation",
         "error_type": type(error).__name__,
         "error": _safe_error(error),
@@ -91,8 +95,12 @@ def _finalize_live_receipt(
     return receipt
 
 
-def _plan(configuration: str | None) -> dict[str, Any]:
+def _plan(
+    configuration: str | None,
+    scenario: str = "supply_chain_malicious_code",
+) -> dict[str, Any]:
     manifest = load_official_gitinject_manifest()
+    scenario_contract = get_official_scenario_contract(manifest, scenario)
     return {
         "mode": "plan_only",
         "network_calls": False,
@@ -100,7 +108,8 @@ def _plan(configuration: str | None) -> dict[str, Any]:
         "github_writes": False,
         "configuration": configuration,
         "official_gitinject_version": manifest["package"]["version"],
-        "scenario": manifest["scenario"]["id"],
+        "scenario": scenario_contract["id"],
+        "scenario_type": scenario_contract["type"],
         "live_guard": "requires --execute-live and an owner/prefix-matched repository",
     }
 
@@ -109,6 +118,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute-live", action="store_true")
     parser.add_argument("--configuration", choices=("baseline", "defended"))
+    parser.add_argument(
+        "--scenario",
+        choices=sorted(SUPPORTED_GITINJECT_SCENARIOS),
+        default="supply_chain_malicious_code",
+    )
     parser.add_argument("--repository-root", type=Path)
     parser.add_argument("--event-path", type=Path)
     parser.add_argument("--artifact-root", type=Path)
@@ -121,7 +135,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.execute_live:
-        print(json.dumps(_plan(args.configuration), indent=2, sort_keys=True))
+        print(json.dumps(_plan(args.configuration, args.scenario), indent=2, sort_keys=True))
         return 0
 
     required = {
@@ -142,6 +156,9 @@ def main() -> int:
 
     output = args.output.resolve()
     try:
+        scenario_contract = get_official_scenario_contract(
+            load_official_gitinject_manifest(), args.scenario
+        )
         event = load_pull_request_event(args.event_path)
         repository = event["repository"]["full_name"]
         repository_id = event["repository"]["id"]
@@ -175,6 +192,7 @@ def main() -> int:
                 event=event,
                 repository_root=args.repository_root,
                 action_sink=sink,
+                scenario_id=args.scenario,
             )
         )
 
@@ -200,7 +218,7 @@ def main() -> int:
             )
         receipt = run_agentdojo_trial(
             configuration=args.configuration,
-            condition="attack",
+            condition=input_contract["condition"],
             environment_mode="gitinject_faithful",
             target_llm=target_llm,
             attenuation_llm=attenuation_llm,
@@ -215,7 +233,8 @@ def main() -> int:
             receipt,
             {
                 "package_version": "0.1.0",
-                "scenario": "supply_chain_malicious_code",
+                "scenario": args.scenario,
+                "scenario_type": scenario_contract["type"],
                 "event_name": os.environ.get("GITHUB_EVENT_NAME"),
                 "repository": repository,
                 "repository_id": repository_id,
@@ -231,7 +250,9 @@ def main() -> int:
         _write_exclusive(output, receipt)
         return 0
     except Exception as error:
-        error_receipt = _action_error_receipt(args.configuration, error)
+        error_receipt = _action_error_receipt(
+            args.configuration, error, scenario=args.scenario
+        )
         try:
             _write_exclusive(output, error_receipt)
         except OSError:

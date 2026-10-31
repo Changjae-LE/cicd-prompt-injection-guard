@@ -101,6 +101,8 @@ def _verify_workflow(
         raise AttriGuardIntegrationError(f"{workflow_id}: required_secrets mismatch")
     if "ATTRIGUARD_BENCHMARK_REPOSITORY_ID" not in metadata.get("required_vars", []):
         raise AttriGuardIntegrationError(f"{workflow_id}: repository ID binding is missing")
+    if "ATTRIGUARD_GITINJECT_SCENARIO" not in metadata.get("required_vars", []):
+        raise AttriGuardIntegrationError(f"{workflow_id}: scenario binding is missing")
     prompt_extraction = metadata.get("prompt_extraction")
     if not isinstance(prompt_extraction, Mapping) or prompt_extraction.get("supported") is not False:
         raise AttriGuardIntegrationError(
@@ -174,7 +176,11 @@ def _verify_workflow(
         raise AttriGuardIntegrationError(f"{workflow_id}: benchmark isolation guard missing")
     if "Refusing repository ID not bound by the GitInject provisioner" not in text:
         raise AttriGuardIntegrationError(f"{workflow_id}: repository ID guard missing")
-    if "--execute-live" not in text or "--repository-root" not in text:
+    if (
+        "--execute-live" not in text
+        or "--repository-root" not in text
+        or '--scenario "${ATTRIGUARD_GITINJECT_SCENARIO}"' not in text
+    ):
         raise AttriGuardIntegrationError(f"{workflow_id}: live adapter invocation missing")
     return metadata, text, document
 
@@ -192,10 +198,13 @@ def verify_integration(
     runtime_text = (root / "gitinject-runtime" / "pyproject.toml").read_text(
         encoding="utf-8"
     )
+    lock_text = (root / "gitinject-runtime" / "uv.lock").read_text(encoding="utf-8")
     if 'requires-python = ">=3.13,<3.14"' not in runtime_text:
         raise AttriGuardIntegrationError("GitInject Python 3.13 boundary is missing")
     if '"gitinject==0.1.0"' not in runtime_text:
         raise AttriGuardIntegrationError("GitInject 0.1.0 dependency pin is missing")
+    if 'requires-python = "==3.13.*"' not in lock_text or 'name = "gitinject"' not in lock_text:
+        raise AttriGuardIntegrationError("GitInject Python 3.13 lock is incomplete")
     for dependency in (
         "anthropic==0.96.0",
         "click==8.3.1",
@@ -285,6 +294,18 @@ def verify_integration(
             "payload_sha256": payload_hash,
             "local_contract_compatible": True,
         },
+        "supported_scenarios": {
+            scenario_id: {
+                "type": scenario["type"],
+                "condition": scenario["condition"],
+                "scenario_sha256": scenario["scenario_sha256"],
+                "changed_files": sorted(scenario["changed_files"]),
+                "official_utility_evaluator": scenario["utility_evaluator"][
+                    "implementation"
+                ],
+            }
+            for scenario_id, scenario in manifest["supported_scenarios"].items()
+        },
         "workflows": list(WORKFLOW_IDS),
         "parity": {
             "yaml_only_difference": "ATTRIGUARD_CONFIGURATION baseline/defended",
@@ -298,6 +319,10 @@ def verify_integration(
             ),
             "expected_required_pairs": [
                 f"{workflow_id}:supply_chain_malicious_code"
+                for workflow_id in WORKFLOW_IDS
+            ]
+            + [
+                f"{workflow_id}:vulnerable_code_review"
                 for workflow_id in WORKFLOW_IDS
             ],
             "known_discovery_limit": (
@@ -320,7 +345,7 @@ def verify_integration(
             "repository_identity": "bound_from_created_repository_id_by_custom_official-runner_client",
             "review_idempotency": "stable_workflow_run_marker_and_preflight_review_lookup",
             "cleanup": "deferred_until_artifact_collection_succeeds",
-            "transitive_lock_complete": False,
+            "transitive_lock_complete": True,
         },
     }
 

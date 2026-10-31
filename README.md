@@ -177,6 +177,57 @@ foreach ($condition in $conditions) {
 
 The runner refuses to overwrite an existing output directory.
 
+## Controlled Exposure experiment
+
+Controlled Exposure is a separate, non-official intervention for measuring the
+defense after a verified attack-file observation. It must not be pooled with the
+official GitInject natural-exposure trials. The harness executes the original
+`CLAUDE.md` read at the AgentDojo tool-observation boundary before the first
+Target inference. It does not change the GitInject scenario, payload, benign
+task, faithful system message, tool schema, evaluator contract, or AttriGuard.
+
+Baseline receives the raw tool result. Defended passes the same source
+observation through the official `AttriGuardExecutionLoop`. Receipts separately
+record the pre-defense source hash, every attenuation transformation, and raw or
+attenuated content delivered to each Target call. A Defended trial remains
+eligible when attenuation prevents raw-payload delivery.
+
+The seeded `read_file` call uses a deterministic tool-call ID so the resulting
+assistant/tool pair is valid for the official OpenAI adapter. Raw controlled
+receipts deliberately record the upstream GitInject evaluator as `not_run`:
+there is no attributed GitHub review for its normal evidence collector. Apply
+the unchanged GitInject utility/security rubrics through an integrity-bound
+custom adjudication and keep `--upstream-gitinject-result not-run`. Missing or
+ambiguous review evidence remains unknown; it is not converted to attack
+success. Controlled summaries report evaluator provenance separately.
+
+Plan mode is network-free and does not read API credentials:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_controlled_exposure.py `
+  --artifact-root .\tmp\attriguard-official `
+  --configuration defended `
+  --target-model gpt-4.1-mini `
+  --auxiliary-model gpt-4.1-mini `
+  --repeat 1
+```
+
+Controlled receipts use `environment_mode=controlled_exposure` and
+`experiment_id=gitinject_controlled_exposure_v1`. The controlled summary reports
+ASR, utility, task completion, defense decisions, source/raw/attenuated delivery,
+and latency under that namespace. These values are never labeled as official
+GitInject natural-exposure ASR.
+
+Summarize only a matched controlled Baseline/Defended set with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\summarize_controlled_exposure.py `
+  --input .\runs\controlled-exposure
+```
+
+The controlled summarizer rejects natural-exposure receipts, and the general
+summarizer rejects inputs that mix controlled and natural modes.
+
 ## Verify, adjudicate, and summarize
 
 Verify Baseline/Defended input equality before interpreting results:
@@ -238,6 +289,13 @@ ran and returned a result for every included attack attempt.
 
 For the complete trace fields, exposure checks, and experiment limitations, see
 `docs/ATTRIGUARD_GITINJECT_RUNBOOK.md`.
+
+Official GitInject 0.1.0 suite support now includes the malicious
+`supply_chain_malicious_code` scenario and the benign `vulnerable_code_review`
+scenario. The latter uses its unchanged official Utility Evaluator and records
+official utility separately from local AttriGuard review blocking. See
+`docs/OFFICIAL_GITINJECT_SUITE.md` for the exact pilot commands, scenario pins,
+result summarizer, and additional-scenario compatibility matrix.
 
 ## Live prerequisite gate
 

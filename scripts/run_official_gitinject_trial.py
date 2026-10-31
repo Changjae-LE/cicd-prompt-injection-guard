@@ -33,13 +33,16 @@ from attriguard_gitinject.attriguard_cicd import (  # noqa: E402
     AttriGuardIntegrationError,
 )
 from attriguard_gitinject.github_actions_integration import (  # noqa: E402
+    SUPPORTED_GITINJECT_SCENARIOS,
     bind_official_and_local_results,
+    get_official_scenario_contract,
     load_official_gitinject_manifest,
 )
 
 
 REPOSITORY_ID_VARIABLE = "ATTRIGUARD_BENCHMARK_REPOSITORY_ID"
 REPOSITORY_ID_SENTINEL = "__BIND_GITINJECT_CREATED_REPOSITORY_ID__"
+SCENARIO_VARIABLE = "ATTRIGUARD_GITINJECT_SCENARIO"
 WORKFLOWS = {"attriguard-gitinject-baseline", "attriguard-gitinject-defended"}
 WORKFLOW_WAIT_TIMEOUT = "Timed out waiting for workflow run or could not find it."
 WORKFLOW_DEPLOYMENT_ERROR = "Workflow deployment verification failed"
@@ -1094,24 +1097,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute-live", action="store_true")
     parser.add_argument("--workflow", choices=sorted(WORKFLOWS), required=True)
-    parser.add_argument("--scenario", default="supply_chain_malicious_code")
+    parser.add_argument(
+        "--scenario",
+        choices=sorted(SUPPORTED_GITINJECT_SCENARIOS),
+        default="supply_chain_malicious_code",
+    )
     parser.add_argument("--repo-prefix", required=True, help="Approved owner/name-prefix")
     parser.add_argument("--workspace", type=Path, default=ROOT)
     args = parser.parse_args()
 
-    if args.scenario != "supply_chain_malicious_code":
-        parser.error("Only the pinned supply_chain_malicious_code scenario is authorized")
     if "/" not in args.repo_prefix:
         parser.error("--repo-prefix must include the approved owner, for example owner/ag-bench")
     expected_owner, expected_prefix = args.repo_prefix.split("/", 1)
     if not expected_owner or not expected_prefix:
         parser.error("--repo-prefix must contain non-empty owner and prefix components")
     manifest = load_official_gitinject_manifest()
+    scenario_contract = get_official_scenario_contract(manifest, args.scenario)
     plan = {
         "mode": "live" if args.execute_live else "plan_only",
         "official_gitinject_version": manifest["package"]["version"],
         "workflow": args.workflow,
         "scenario": args.scenario,
+        "scenario_type": scenario_contract["type"],
         "repo_prefix": args.repo_prefix,
         "repository_identity_binding": REPOSITORY_ID_VARIABLE,
         "cleanup_policy": "only_after_verified_artifact_collection",
@@ -1143,6 +1150,7 @@ def main() -> int:
         parser.error("ATTRIGUARD_BENCHMARK_PREFIX differs from --repo-prefix prefix")
 
     os.environ[REPOSITORY_ID_VARIABLE] = REPOSITORY_ID_SENTINEL
+    os.environ[SCENARIO_VARIABLE] = args.scenario
     try:
         IdentityClient, Runner = _build_live_types(expected_owner, expected_prefix)
         owner_client = IdentityClient()
