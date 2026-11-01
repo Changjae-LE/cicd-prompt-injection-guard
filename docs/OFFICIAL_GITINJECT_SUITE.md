@@ -5,6 +5,9 @@ GitInject 0.1.0. It does not modify GitInject scenarios, payloads, evaluators,
 or the AttriGuard core. Official natural-exposure trials and Controlled
 Exposure remain separate experiments.
 
+The confirmatory five-repeat BU/UA/ASR/Latency protocol and complete 19-scenario
+compatibility audit are in `ATTRIGUARD_SECTION5_GITINJECT_PROTOCOL.md`.
+
 ## Supported official scenarios
 
 | Scenario | Type | Official evaluator path | Local condition | Status |

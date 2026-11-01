@@ -1104,7 +1104,27 @@ def main() -> int:
     )
     parser.add_argument("--repo-prefix", required=True, help="Approved owner/name-prefix")
     parser.add_argument("--workspace", type=Path, default=ROOT)
+    parser.add_argument("--campaign-id")
+    parser.add_argument("--campaign-trial-id")
+    parser.add_argument("--repetition", type=int)
+    parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
+
+    campaign_values = (
+        args.campaign_id,
+        args.campaign_trial_id,
+        args.repetition,
+        args.result_json,
+    )
+    if any(value is not None for value in campaign_values) and not all(
+        value is not None for value in campaign_values
+    ):
+        parser.error(
+            "campaign attribution requires --campaign-id, --campaign-trial-id, "
+            "--repetition, and --result-json together"
+        )
+    if args.repetition is not None and not 1 <= args.repetition <= 5:
+        parser.error("--repetition must be between 1 and 5")
 
     if "/" not in args.repo_prefix:
         parser.error("--repo-prefix must include the approved owner, for example owner/ag-bench")
@@ -1124,6 +1144,9 @@ def main() -> int:
         "cleanup_policy": "only_after_verified_artifact_collection",
         "network_calls": bool(args.execute_live),
         "remote_writes": bool(args.execute_live),
+        "campaign_id": args.campaign_id,
+        "campaign_trial_id": args.campaign_trial_id,
+        "repetition": args.repetition,
     }
     if not args.execute_live:
         print(json.dumps(plan, indent=2, sort_keys=True))
@@ -1168,6 +1191,19 @@ def main() -> int:
     except (AttriGuardIntegrationError, OSError, RuntimeError, ValueError) as error:
         print(f"Official GitInject trial failed: {error}", file=sys.stderr)
         return 1
+    if args.result_json is not None:
+        controller_record = {
+            "schema_version": "causentry_gitinject_campaign_trial_result_v1",
+            "campaign_id": args.campaign_id,
+            "campaign_trial_id": args.campaign_trial_id,
+            "repetition": args.repetition,
+            "workflow": args.workflow,
+            "scenario": args.scenario,
+            "result": result,
+        }
+        result_path = args.result_json.resolve()
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_exclusive(result_path, controller_record)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
     return 1 if result.get("error") else 0
 

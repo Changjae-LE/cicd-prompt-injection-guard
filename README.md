@@ -132,6 +132,13 @@ No-review and defense-blocked trials remain official evaluator errors/unknown;
 they are never rewritten as attack success. Trial Validity Gate classifications
 remain a separate local result.
 
+The five-repeat USENIX Security 2026 Section 5-style protocol, complete
+19-scenario compatibility audit, resumable campaign commands, BU/UA/ASR
+denominators, and expected live API scope are documented in
+`docs/ATTRIGUARD_SECTION5_GITINJECT_PROTOCOL.md`. The campaign CLI is offline by
+default and requires both `--resume` and `--execute-live` before it can invoke a
+live trial.
+
 ## Validate an experiment plan without API calls
 
 Omitting `--execute-model-calls` verifies the core, fixture, and configuration

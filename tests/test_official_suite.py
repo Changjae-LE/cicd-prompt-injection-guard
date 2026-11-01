@@ -1,6 +1,8 @@
 import json
+import importlib.util
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 
@@ -15,6 +17,19 @@ from attriguard_gitinject.github_actions_integration import (  # noqa: E402
 from attriguard_gitinject.official_suite import (  # noqa: E402
     discover_official_binding_paths,
     summarize_official_gitinject_suite,
+)
+from attriguard_gitinject.official_experiment import (  # noqa: E402
+    audit_installed_gitinject,
+    build_campaign_plan,
+    campaign_binding_paths,
+    campaign_progress,
+    load_campaign_state,
+    load_compatibility_registry,
+    load_section5_protocol,
+    reconcile_trial,
+    select_next_trial,
+    transition_trial,
+    write_campaign_state,
 )
 
 
@@ -279,6 +294,8 @@ class OfficialSuiteSummarizerTests(unittest.TestCase):
         self.assertEqual(metric["status"], "unknown")
         self.assertIsNone(metric["value"])
         self.assertEqual(metric["unknown"], 1)
+        self.assertIsNone(metric["mean"])
+        self.assertIsNone(metric["sample_standard_deviation"])
         self.assertEqual(summary["local_validity"], {"valid": 1, "invalid": 0, "unknown": 0})
         self.assertEqual(
             summary["official_primary_evaluation"],
@@ -364,6 +381,205 @@ class OfficialSuiteSummarizerTests(unittest.TestCase):
             "controlled_or_non_official_environment",
         )
         self.assertEqual(discover_official_binding_paths([eligible]), [eligible.resolve()])
+
+    def test_section5_table_reports_mean_standard_deviation_and_denominators(self):
+        outcomes = [True, True, False, True, False]
+        latencies = [100.0, 200.0, 300.0, 400.0, 500.0]
+        for index, (security, latency) in enumerate(zip(outcomes, latencies), start=1):
+            self.write_attempt(
+                name=f"attack-{index}",
+                scenario="supply_chain_malicious_code",
+                scenario_type="malicious",
+                configuration="baseline",
+                utility=True,
+                security=security,
+                exposed=index <= 2,
+                latency_ms=latency,
+            )
+        summary = summarize_official_gitinject_suite([self.root])
+        metric = summary["scenarios"]["supply_chain_malicious_code"][
+            "configurations"
+        ]["baseline"]["section5_primary_metrics"]["ASR"]
+        self.assertEqual(metric["successes"], 3)
+        self.assertEqual(metric["known"], 5)
+        self.assertEqual(metric["attempts"], 5)
+        self.assertAlmostEqual(metric["mean"], 0.6)
+        self.assertAlmostEqual(metric["sample_standard_deviation"], 0.5477225575)
+        latency = summary["scenarios"]["supply_chain_malicious_code"][
+            "configurations"
+        ]["baseline"]["section5_primary_metrics"]["Latency"]
+        self.assertEqual(latency["known"], 5)
+        self.assertEqual(latency["mean_ms"], 300.0)
+        self.assertAlmostEqual(latency["sample_standard_deviation_ms"], 158.113883)
+        row = next(
+            item
+            for item in summary["table_1"]["rows"]
+            if item["scenario"] == "supply_chain_malicious_code"
+            and item["configuration"] == "baseline"
+        )
+        self.assertEqual(row["valid_trials"], 5)
+        self.assertEqual(row["ASR"]["known"], 5)
+        self.assertEqual(row["BU"]["status"], "not_applicable")
+        self.assertEqual(summary["protocol"]["paper_lambda"], 2)
+
+
+class OfficialExperimentProtocolTests(unittest.TestCase):
+    def test_protocol_and_compatibility_registry_pin_the_supported_subset(self):
+        protocol = load_section5_protocol()
+        compatibility = load_compatibility_registry()
+        self.assertEqual(protocol["repetitions_per_scenario_configuration"], 5)
+        self.assertEqual(protocol["attriguard"]["paper_lambda"], 2)
+        self.assertEqual(protocol["attriguard"]["auxiliary_model"], "gpt-4.1-mini")
+        self.assertEqual(len(compatibility["scenarios"]), 19)
+        supported = {
+            name
+            for name, value in compatibility["scenarios"].items()
+            if value["adapter_status"] == "supported"
+        }
+        self.assertEqual(
+            supported,
+            {"supply_chain_malicious_code", "vulnerable_code_review"},
+        )
+        for name, value in compatibility["scenarios"].items():
+            if name not in supported:
+                self.assertTrue(value["exclusion_reasons"])
+
+    def test_campaign_plan_pairs_five_repetitions_and_requires_live_flag(self):
+        plan = build_campaign_plan(
+            campaign_id="section5-test",
+            repo_prefix="benchmark-owner/ag-bench",
+            workspace=ROOT,
+            evaluation_ref="a" * 40,
+            created_at="2026-11-01T00:00:00Z",
+        )
+        self.assertEqual(len(plan["trials"]), 20)
+        self.assertEqual(plan["repetitions_per_scenario_configuration"], 5)
+        counts = {}
+        for trial in plan["trials"]:
+            key = (trial["scenario"], trial["configuration"])
+            counts[key] = counts.get(key, 0) + 1
+            self.assertIn("--execute-live", trial["command"])
+            self.assertEqual(trial["status"], "pending")
+        self.assertTrue(all(value == 5 for value in counts.values()))
+        supply = [
+            item
+            for item in plan["trials"]
+            if item["scenario"] == "supply_chain_malicious_code"
+        ]
+        self.assertEqual(supply[0]["configuration"], "baseline")
+        self.assertEqual(supply[2]["configuration"], "defended")
+        self.assertFalse(plan["controlled_exposure_included"])
+
+    def test_campaign_state_is_hashed_resumable_and_running_requires_reconciliation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            state = build_campaign_plan(
+                campaign_id="resume-test",
+                repo_prefix="benchmark-owner/ag-bench",
+                workspace=ROOT,
+                scenarios=["vulnerable_code_review"],
+                evaluation_ref="b" * 40,
+                created_at="2026-11-01T00:00:00Z",
+            )
+            write_campaign_state(state_path, state, exclusive=True)
+            with self.assertRaises(FileExistsError):
+                write_campaign_state(state_path, state, exclusive=True)
+            loaded = load_campaign_state(state_path)
+            self.assertEqual(campaign_progress(loaded)["pending"], 10)
+            trial = select_next_trial(loaded)
+            self.assertIsNotNone(trial)
+            running = transition_trial(
+                loaded,
+                trial["trial_id"],
+                "running",
+                timestamp="2026-11-01T00:01:00Z",
+            )
+            with self.assertRaisesRegex(ValueError, "reconcile"):
+                select_next_trial(running)
+            interrupted = transition_trial(
+                running,
+                trial["trial_id"],
+                "needs_reconciliation",
+                timestamp="2026-11-01T00:02:00Z",
+            )
+            resumed = reconcile_trial(
+                interrupted,
+                trial["trial_id"],
+                "retry",
+                timestamp="2026-11-01T00:03:00Z",
+            )
+            self.assertEqual(select_next_trial(resumed)["trial_id"], trial["trial_id"])
+
+            binding = Path(temporary) / "attempt" / "binding.json"
+            binding.parent.mkdir()
+            binding.write_text("{}\n", encoding="utf-8")
+            rerunning = transition_trial(
+                resumed,
+                trial["trial_id"],
+                "running",
+                timestamp="2026-11-01T00:04:00Z",
+            )
+            succeeded = transition_trial(
+                rerunning,
+                trial["trial_id"],
+                "succeeded",
+                return_code=0,
+                result_record={"binding": str(binding)},
+                timestamp="2026-11-01T00:05:00Z",
+            )
+            self.assertEqual(campaign_binding_paths(succeeded), [binding.resolve()])
+            self.assertNotEqual(
+                select_next_trial(succeeded)["trial_id"], trial["trial_id"]
+            )
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                campaign_binding_paths(succeeded, require_complete=True)
+            tampered = json.loads(state_path.read_text(encoding="utf-8"))
+            tampered["target_model"] = "tampered-model"
+            state_path.write_text(
+                json.dumps(tampered, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                load_campaign_state(state_path)
+
+    @unittest.skipUnless(importlib.util.find_spec("gitinject"), "GitInject runtime unavailable")
+    def test_installed_gitinject_scenario_inventory_matches_offline_audit(self):
+        report = audit_installed_gitinject(workspace=ROOT)
+        self.assertTrue(report["audit_passed"], report["errors"])
+        self.assertEqual(report["gitinject_version"], "0.1.0")
+        self.assertEqual(report["scenario_count"], 19)
+        self.assertEqual(
+            report["supported"],
+            ["supply_chain_malicious_code", "vulnerable_code_review"],
+        )
+
+    def test_campaign_cli_is_offline_by_default_and_rejects_uninitialized_live(self):
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "run_official_gitinject_campaign.py"),
+            "--campaign-id",
+            "cli-dry-run",
+            "--repo-prefix",
+            "benchmark-owner/ag-bench",
+            "--workspace",
+            str(ROOT),
+            "--evaluation-ref",
+            "c" * 40,
+        ]
+        planned = subprocess.run(command, capture_output=True, text=True, check=False)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        preview = json.loads(planned.stdout)
+        self.assertEqual(preview["mode"], "plan_only")
+        self.assertFalse(preview["network_calls"])
+        self.assertFalse(preview["remote_writes"])
+        refused = subprocess.run(
+            [*command, "--execute-live"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("requires --resume", refused.stderr)
 
 
 if __name__ == "__main__":

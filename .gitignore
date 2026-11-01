@@ -32,6 +32,7 @@ tmp/
 
 # Generated experiment evidence and logs
 runs/
+reports/
 results/
 outputs/
 logs/

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from statistics import fmean
+from statistics import fmean, stdev
 from typing import Any, Iterable, Mapping, Sequence
 
 from .attriguard_cicd import (
@@ -22,9 +22,10 @@ from .github_actions_integration import (
     get_official_scenario_contract,
     load_official_gitinject_manifest,
 )
+from .official_experiment import load_section5_protocol
 
 
-SUMMARY_SCHEMA = "causentry_official_gitinject_suite_summary_v1"
+SUMMARY_SCHEMA = "causentry_official_gitinject_suite_summary_v2"
 BINDING_SCHEMA = "causentry_gitinject_result_binding_v1"
 TRIAL_SCHEMA = "causentry_attriguard_gitinject_trial_v3"
 
@@ -255,11 +256,24 @@ def _binary_metric(values: Iterable[bool | None], *, applicable: bool = True) ->
             "known": 0,
             "unknown": 0,
             "attempts": 0,
+            "mean": None,
+            "known_mean": None,
+            "sample_standard_deviation": None,
+            "known_sample_standard_deviation": None,
+            "mean_percent": None,
+            "sample_standard_deviation_percentage_points": None,
         }
     known = [value for value in values if isinstance(value, bool)]
     successes = sum(value is True for value in known)
     unknown = len(values) - len(known)
     complete = bool(values) and unknown == 0
+    numeric = [1.0 if value else 0.0 for value in known]
+    known_mean = fmean(numeric) if numeric else None
+    known_standard_deviation = stdev(numeric) if len(numeric) >= 2 else None
+    confirmed_mean = known_mean if complete else None
+    confirmed_standard_deviation = (
+        known_standard_deviation if complete else None
+    )
     return {
         "status": (
             "confirmed"
@@ -270,20 +284,29 @@ def _binary_metric(values: Iterable[bool | None], *, applicable: bool = True) ->
             if known
             else "unknown"
         ),
-        "value": successes / len(known) if complete else None,
-        "known_value": successes / len(known) if known else None,
+        "value": confirmed_mean,
+        "known_value": known_mean,
         "successes": successes,
         "known": len(known),
         "unknown": unknown,
         "attempts": len(values),
+        "mean": confirmed_mean,
+        "known_mean": known_mean,
+        "sample_standard_deviation": confirmed_standard_deviation,
+        "known_sample_standard_deviation": known_standard_deviation,
+        "mean_percent": confirmed_mean * 100 if confirmed_mean is not None else None,
+        "sample_standard_deviation_percentage_points": (
+            confirmed_standard_deviation * 100
+            if confirmed_standard_deviation is not None
+            else None
+        ),
     }
 
 
 def _latency_metric(values: Iterable[float | None]) -> dict[str, Any]:
     values = list(values)
     known = [value for value in values if isinstance(value, (int, float))]
-    return {
-        "status": (
+    status = (
             "confirmed"
             if values and len(known) == len(values)
             else "no_attempts"
@@ -291,13 +314,58 @@ def _latency_metric(values: Iterable[float | None]) -> dict[str, Any]:
             else "partial_unknown"
             if known
             else "unknown"
+        )
+    complete = status == "confirmed"
+    known_mean = fmean(known) if known else None
+    known_standard_deviation = stdev(known) if len(known) >= 2 else None
+    return {
+        "status": status,
+        "mean_ms": known_mean if complete else None,
+        "known_mean_ms": known_mean,
+        "sample_standard_deviation_ms": (
+            known_standard_deviation if complete else None
         ),
-        "mean_ms": fmean(known) if known else None,
+        "known_sample_standard_deviation_ms": known_standard_deviation,
         "minimum_ms": min(known) if known else None,
         "maximum_ms": max(known) if known else None,
         "known": len(known),
         "unknown": len(values) - len(known),
         "attempts": len(values),
+    }
+
+
+def _section5_metrics(configuration: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose paper primary metrics separately from diagnostic metrics."""
+
+    return {
+        "BU": deepcopy(configuration["benign_utility"]),
+        "UA": deepcopy(configuration["utility_under_attack"]),
+        "ASR": deepcopy(configuration["official_attempt_level_asr"]),
+        "Latency": deepcopy(configuration["latency"]),
+    }
+
+
+def _paper_table_row(
+    *,
+    scope: str,
+    scenario: str | None,
+    scenario_type: str | None,
+    configuration: str,
+    metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    primary = _section5_metrics(metrics)
+    return {
+        "scope": scope,
+        "scenario": scenario,
+        "scenario_type": scenario_type,
+        "configuration": configuration,
+        "valid_trials": metrics["sample_accounting"]["valid_samples"],
+        "invalid_trials_excluded": metrics["sample_accounting"]["invalid_excluded"],
+        "validity_unknown_excluded": metrics["sample_accounting"]["validity_unknown"],
+        "BU": primary["BU"],
+        "UA": primary["UA"],
+        "ASR": primary["ASR"],
+        "Latency": primary["Latency"],
     }
 
 
@@ -334,7 +402,7 @@ def _configuration_metrics(
         )
         for item in valid_records
     ]
-    return {
+    metrics = {
         "attempts": len(valid_records),
         "bindings_observed": len(records),
         "sample_accounting": {
@@ -347,6 +415,30 @@ def _configuration_metrics(
             "evaluation_incomplete": sum(
                 value is None for value in primary_evaluation_values
             ),
+        },
+        "evaluator_accounting": {
+            "utility": {
+                "known": sum(
+                    isinstance(item["official_utility_achieved"], bool)
+                    for item in valid_records
+                ),
+                "unknown": sum(
+                    item["official_utility_achieved"] is None
+                    for item in valid_records
+                ),
+                "applicable": len(valid_records),
+            },
+            "security": {
+                "known": sum(
+                    isinstance(item["official_security_breached"], bool)
+                    for item in malicious
+                ),
+                "unknown": sum(
+                    item["official_security_breached"] is None
+                    for item in malicious
+                ),
+                "applicable": len(malicious),
+            },
         },
         "official_attempt_level_asr": _binary_metric(
             (item["official_security_breached"] for item in malicious),
@@ -387,6 +479,17 @@ def _configuration_metrics(
         ),
         "latency": _latency_metric(item["latency_ms"] for item in valid_records),
     }
+    metrics["section5_primary_metrics"] = _section5_metrics(metrics)
+    metrics["diagnostic_metrics"] = {
+        "FPR": deepcopy(metrics["false_positive_rate"]),
+        "AttackExposureRate": deepcopy(metrics["attack_exposure_rate"]),
+        "ExposureConditionedASR": deepcopy(
+            metrics["official_exposure_conditioned_asr"]
+        ),
+        "TaskCompletionRate": deepcopy(metrics["task_completion_rate"]),
+        "ReviewActionBlockRate": deepcopy(metrics["review_action_block_rate"]),
+    }
+    return metrics
 
 
 def _parity_report(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -431,7 +534,15 @@ def _parity_report(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "identical": identical,
             "observed": observed,
         }
+    count_equal = len(by_configuration["baseline"]) == len(
+        by_configuration["defended"]
+    )
+    count_known = bool(by_configuration["baseline"]) and bool(
+        by_configuration["defended"]
+    )
     mismatches = [name for name, item in fields.items() if item["identical"] is False]
+    if count_known and not count_equal:
+        mismatches.append("attempt_count")
     unknown = [name for name, item in fields.items() if item["identical"] is None]
     return {
         "status": "failed" if mismatches else "unknown" if unknown else "passed",
@@ -439,6 +550,11 @@ def _parity_report(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "valid_samples": len(records),
         "baseline_attempts": len(by_configuration["baseline"]),
         "defended_attempts": len(by_configuration["defended"]),
+        "attempt_counts_equal": count_equal if count_known else None,
+        "five_repetitions_complete": (
+            len(by_configuration["baseline"]) == 5
+            and len(by_configuration["defended"]) == 5
+        ),
         "fields": fields,
         "mismatches": mismatches,
         "unknown_fields": unknown,
@@ -480,6 +596,7 @@ def summarize_official_gitinject_suite(
     if not paths:
         raise AttriGuardIntegrationError("No official GitInject binding.json files found")
     manifest = load_official_gitinject_manifest()
+    protocol = load_section5_protocol()
     scenario_contracts = {
         scenario_id: get_official_scenario_contract(manifest, scenario_id)
         for scenario_id in sorted(manifest["supported_scenarios"])
@@ -533,6 +650,27 @@ def summarize_official_gitinject_suite(
         )
         for configuration in ("baseline", "defended")
     }
+    table_rows = [
+        _paper_table_row(
+            scope="scenario",
+            scenario=scenario_id,
+            scenario_type=scenario_results[scenario_id]["scenario_type"],
+            configuration=configuration,
+            metrics=scenario_results[scenario_id]["configurations"][configuration],
+        )
+        for scenario_id in sorted(scenario_results)
+        for configuration in ("baseline", "defended")
+    ]
+    table_rows.extend(
+        _paper_table_row(
+            scope="overall",
+            scenario=None,
+            scenario_type=None,
+            configuration=configuration,
+            metrics=overall_configurations[configuration],
+        )
+        for configuration in ("baseline", "defended")
+    )
     valid_records = [item for item in records if item["trial_validity"] == "valid"]
     invalid_records = [item for item in records if item["trial_validity"] == "invalid"]
     validity_unknown_records = [
@@ -546,11 +684,28 @@ def summarize_official_gitinject_suite(
         )
         for item in valid_records
     ]
+    utility_values = [item["official_utility_achieved"] for item in valid_records]
+    malicious_security_values = [
+        item["official_security_breached"]
+        for item in valid_records
+        if item["scenario_type"] == "malicious"
+    ]
     result = {
         "schema_version": SUMMARY_SCHEMA,
         "gitinject_version": manifest["package"]["version"],
         "source": "official_gitinject_binding_json_plus_separate_local_validity_gate",
         "controlled_exposure_included": False,
+        "protocol": {
+            "schema_version": protocol["schema_version"],
+            "repetitions_per_scenario_configuration": protocol[
+                "repetitions_per_scenario_configuration"
+            ],
+            "paper_lambda": protocol["attriguard"]["paper_lambda"],
+            "survival_mode": protocol["attriguard"]["survival_mode"],
+            "auxiliary_model": protocol["attriguard"]["auxiliary_model"],
+            "primary_metrics": deepcopy(protocol["primary_metrics"]),
+            "diagnostic_metrics": deepcopy(protocol["diagnostic_metrics"]),
+        },
         "unknown_policy": (
             "Missing evaluator or local validity evidence remains unknown; overall metric "
             "value is null until every included attempt is known."
@@ -558,6 +713,10 @@ def summarize_official_gitinject_suite(
         "binding_files_discovered": len(paths),
         "natural_bindings_classified": len(records),
         "official_attempts_included": len(valid_records),
+        "five_repeat_design_complete": all(
+            item["input_parity"]["five_repetitions_complete"]
+            for item in scenario_results.values()
+        ),
         "excluded": excluded,
         "validity_policy": (
             "Only trials with an integrity-valid receipt and gate_passed=true enter "
@@ -575,7 +734,30 @@ def summarize_official_gitinject_suite(
             ),
             "incomplete": sum(value is None for value in primary_evaluation_values),
         },
+        "official_evaluator_accounting": {
+            "utility": {
+                "known": sum(isinstance(value, bool) for value in utility_values),
+                "unknown": sum(value is None for value in utility_values),
+                "applicable": len(utility_values),
+            },
+            "security": {
+                "known": sum(
+                    isinstance(value, bool) for value in malicious_security_values
+                ),
+                "unknown": sum(
+                    value is None for value in malicious_security_values
+                ),
+                "applicable": len(malicious_security_values),
+            },
+        },
         "scenarios": scenario_results,
+        "table_1": {
+            "format": "AttriGuard Section 5 style with GitInject official verdicts",
+            "binary_statistics": "mean and sample standard deviation across trial-level 0/1 outcomes",
+            "latency_statistics": "mean and sample standard deviation in milliseconds",
+            "standard_deviation_policy": "sample standard deviation (n-1); null when fewer than two known observations",
+            "rows": table_rows,
+        },
         "overall": {
             "configurations": overall_configurations,
             "latency_overhead": _latency_overhead(overall_configurations),
